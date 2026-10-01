@@ -1,15 +1,16 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from bs4 import BeautifulSoup
+from io import StringIO
+import time
 import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================
 # KONFIGURASI
 # ============================================================
-# Bobot faktor (contoh, idealnya dari backtest)
 FACTOR_WEIGHTS = {
     'value': 0.25,
     'quality': 0.30,
@@ -19,85 +20,131 @@ FACTOR_WEIGHTS = {
 }
 
 # ============================================================
-# STEP 1: FETCH UNIVERSE (S&P 500 dari Wikipedia)
+# STEP 1: UNIVERSE
 # ============================================================
-def get_all_us_tickers():
-    """Mengambil daftar seluruh saham AS dari NASDAQ Stock Screener."""
-    url = "https://www.nasdaq.com/market-activity/stocks/screener"
+def get_all_us_tickers(limit=None):
+    """Mengambil daftar saham AS dari NASDAQ Stock Screener."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    # NASDAQ menyediakan endpoint JSON internal yang bisa kita akses
     api_url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&offset=0"
-    response = requests.get(api_url, headers=headers)
-    data = response.json()
-    
-    tickers = [row['symbol'] for row in data['data']['rows']]
-    # Bersihkan ticker yang mengandung karakter aneh (misal: warrant, right)
-    tickers = [t for t in tickers if t.isalpha() and len(t) <= 5]
-    return tickers
+    try:
+        response = requests.get(api_url, headers=headers, timeout=15)
+        data = response.json()
+        tickers = [row['symbol'] for row in data['data']['rows']]
+        tickers = [t for t in tickers if t.isalpha() and len(t) <= 5]
+        if limit:
+            tickers = tickers[:limit]
+        return tickers
+    except Exception as e:
+        st.warning(f"Gagal ambil universe dari NASDAQ ({e}). Pakai fallback S&P 100.")
+        return get_fallback_tickers()
+
+def get_fallback_tickers():
+    """Fallback: 100 saham besar jika API NASDAQ gagal."""
+    return [
+        'AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK-B','UNH','XOM',
+        'JNJ','JPM','V','PG','MA','HD','CVX','MRK','ABBV','LLY','PEP','KO',
+        'AVGO','COST','WMT','TMO','MCD','CSCO','ACN','ABT','CRM','ADBE','DHR',
+        'LIN','NKE','TXN','AMD','PM','NEE','WFC','DIS','UPS','RTX','BMY','ORCL',
+        'QCOM','INTC','HON','T','UNP','BA','LOW','SBUX','GS','INTU','AMAT','DE',
+        'BLK','ISRG','ADI','MDLZ','GILD','ADP','VRTX','REGN','MMC','LRCX','ZTS',
+        'CI','CB','SO','DUK','PGR','BDX','ITW','SYK','BSX','MO','APD','EQIX',
+        'CCI','PLD','NSC','AON','MU','EL','KLAC','SNPS','CDNS','MRVL','FTNT',
+        'PANW','CRWD','DDOG','SNOW','ZS','NET'
+    ]
 
 # ============================================================
-# STEP 2: FETCH DATA PER SAHAM (BANYAK FAKTOR)
+# STEP 2: HELPER — ALTman Z-Score
+# ============================================================
+def calculate_altman_z(info):
+    """Hitung Altman Z-Score untuk risiko kebangkrutan."""
+    try:
+        wc = info.get('totalCurrentAssets', 0) - info.get('totalCurrentLiabilities', 0)
+        ta = info.get('totalAssets', 1) or 1
+        re = info.get('retainedEarnings', 0)
+        ebit = info.get('ebit', 0)
+        mcap = info.get('marketCap', 0)
+        tl = info.get('totalLiabilities', 1) or 1
+        sales = info.get('totalRevenue', 0)
+
+        if ta <= 0 or tl <= 0:
+            return np.nan
+
+        z = (1.2 * (wc/ta) + 1.4 * (re/ta) + 3.3 * (ebit/ta) +
+             0.6 * (mcap/tl) + 1.0 * (sales/ta))
+        return z
+    except:
+        return np.nan
+
+# ============================================================
+# STEP 3: FETCH DATA PER SAHAM
 # ============================================================
 def fetch_stock_data(ticker):
     """Fetch data fundamental, harga, dan sentimen untuk satu saham."""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        hist = stock.history(period='2y') # 2 tahun untuk momentum 12-1
-        
+        hist = stock.history(period='2y')
+
         if hist.empty or len(hist) < 300:
             return None
-        
-        # --- Fundamental (Value & Quality) ---
-        pe = info.get('trailingPE', np.nan)
+
+        # --- Value (forward-looking) ---
+        forward_pe = info.get('forwardPE', np.nan)
+        trailing_pe = info.get('trailingPE', np.nan)
         pb = info.get('priceToBook', np.nan)
         ps = info.get('priceToSalesTrailing12Months', np.nan)
+
+        # --- Quality ---
         roe = info.get('returnOnEquity', np.nan)
         roa = info.get('returnOnAssets', np.nan)
         margin = info.get('operatingMargins', np.nan)
-        
-        # --- Quality Lanjutan (Accruals & F-Score) ---
-        # Accruals: (Net Income - CFO) / Total Assets. Makin rendah makin baik.
+
         net_income = info.get('netIncomeToCommon', np.nan)
         cfo = info.get('operatingCashflow', np.nan)
         total_assets = info.get('totalAssets', np.nan)
         accruals = (net_income - cfo) / total_assets if total_assets and total_assets > 0 else np.nan
-        
+
+        # --- Financial Health Filters ---
+        altman_z = calculate_altman_z(info)
+        debt_to_equity = info.get('debtToEquity', np.nan)
+
         # --- Momentum (12-1) ---
         close = hist['Close']
-        # Return 12 bulan (252 hari) sampai 1 bulan lalu (21 hari)
         if len(close) >= 273:
             return_12_1 = (close.iloc[-22] / close.iloc[-273] - 1) * 100
         else:
             return_12_1 = np.nan
-        
+
         # --- Low Volatility ---
         daily_returns = close.pct_change().dropna()
         volatility_1y = daily_returns.tail(252).std() * np.sqrt(252) * 100
-        
-        # --- Analyst Sentiment (dari yfinance) ---
-        # yfinance menyediakan targetMeanPrice dan numberOfAnalystOpinions
+
+        # --- Analyst Sentiment ---
         target_mean = info.get('targetMeanPrice', np.nan)
         current_price = close.iloc[-1]
         analyst_upside = ((target_mean / current_price) - 1) * 100 if target_mean and current_price else np.nan
-        
-        # --- Short Interest (dari info) ---
-        short_ratio = info.get('shortRatio', np.nan) # Days to cover
+
+        # --- Short Interest ---
+        short_ratio = info.get('shortRatio', np.nan)
         short_percent_float = info.get('shortPercentOfFloat', np.nan)
-        
-        # --- Sector (untuk sector-neutral scoring) ---
+
+        # --- Sector ---
         sector = info.get('sector', 'Unknown')
-        
+
         return {
             'ticker': ticker,
             'sector': sector,
             'price': current_price,
-            'pe': pe, 'pb': pb, 'ps': ps,
+            'forward_pe': forward_pe,
+            'trailing_pe': trailing_pe,
+            'pb': pb, 'ps': ps,
             'roe': roe, 'roa': roa, 'margin': margin,
             'accruals': accruals,
+            'altman_z': altman_z,
+            'debt_to_equity': debt_to_equity,
             'return_12_1': return_12_1,
             'volatility': volatility_1y,
             'analyst_upside': analyst_upside,
@@ -109,66 +156,49 @@ def fetch_stock_data(ticker):
         return None
 
 # ============================================================
-# STEP 3: WINSORIZATION & SECTOR-NEUTRAL SCORING
+# STEP 4: SCORING
 # ============================================================
 def winsorize(series, lower=0.01, upper=0.99):
-    """Potong outlier pada persentil tertentu."""
     return series.clip(series.quantile(lower), series.quantile(upper))
 
 def sector_neutral_score(df, column, ascending=True):
-    """
-    Hitung percentile rank DI DALAM SEKTOR masing-masing.
-    ascending=True: nilai rendah = skor tinggi (untuk P/E, accruals, short interest)
-    ascending=False: nilai tinggi = skor tinggi (untuk ROE, momentum, analyst upside)
-    """
-    scores = df.groupby('sector')[column].rank(pct=True, ascending=ascending) * 100
-    return scores
+    return df.groupby('sector')[column].rank(pct=True, ascending=ascending) * 100
 
 def calculate_scores(df):
-    """Hitung skor komposit dengan normalisasi sector-neutral."""
     df = df.copy()
-    
-    # 1. Winsorize semua kolom numerik
-    numeric_cols = ['pe', 'pb', 'ps', 'roe', 'roa', 'margin', 'accruals', 
-                    'return_12_1', 'volatility', 'analyst_upside', 
-                    'short_ratio', 'short_percent_float']
+
+    # 1. Winsorize
+    numeric_cols = ['forward_pe', 'trailing_pe', 'pb', 'ps', 'roe', 'roa',
+                    'margin', 'accruals', 'return_12_1', 'volatility',
+                    'analyst_upside', 'short_ratio', 'short_percent_float']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = winsorize(df[col])
-    
-    # 2. Hitung skor sector-neutral untuk setiap metrik
-    # Value: makin rendah makin baik
-    df['pe_score'] = sector_neutral_score(df, 'pe', ascending=True)
+
+    # 2. Sector-neutral scores
+    df['fpe_score'] = sector_neutral_score(df, 'forward_pe', ascending=True)
     df['pb_score'] = sector_neutral_score(df, 'pb', ascending=True)
     df['ps_score'] = sector_neutral_score(df, 'ps', ascending=True)
-    
-    # Quality: makin tinggi makin baik, tapi accruals makin rendah makin baik
+
     df['roe_score'] = sector_neutral_score(df, 'roe', ascending=False)
     df['roa_score'] = sector_neutral_score(df, 'roa', ascending=False)
     df['margin_score'] = sector_neutral_score(df, 'margin', ascending=False)
-    df['accruals_score'] = sector_neutral_score(df, 'accruals', ascending=True) # rendah = baik
-    
-    # Momentum: 12-1 return, makin tinggi makin baik
+    df['accruals_score'] = sector_neutral_score(df, 'accruals', ascending=True)
+
     df['momentum_score'] = sector_neutral_score(df, 'return_12_1', ascending=False)
-    
-    # Low Volatility: makin rendah makin baik
     df['low_vol_score'] = sector_neutral_score(df, 'volatility', ascending=True)
-    
-    # Analyst Sentiment: makin tinggi upside makin baik
     df['sentiment_score'] = sector_neutral_score(df, 'analyst_upside', ascending=False)
-    
-    # Short Interest: makin rendah makin baik (hindari saham yang di-short)
     df['short_score'] = sector_neutral_score(df, 'short_percent_float', ascending=True)
-    
+
     # 3. Agregasi per faktor
-    df['value_score'] = (df['pe_score'] * 0.4 + df['pb_score'] * 0.3 + df['ps_score'] * 0.3)
-    df['quality_score'] = (df['roe_score'] * 0.3 + df['roa_score'] * 0.2 + 
+    df['value_score'] = df['fpe_score'] * 0.5 + df['pb_score'] * 0.25 + df['ps_score'] * 0.25
+    df['quality_score'] = (df['roe_score'] * 0.3 + df['roa_score'] * 0.2 +
                            df['margin_score'] * 0.3 + df['accruals_score'] * 0.2)
     df['momentum_score_final'] = df['momentum_score']
     df['sentiment_score_final'] = df['sentiment_score'] * 0.7 + df['short_score'] * 0.3
     df['low_vol_score_final'] = df['low_vol_score']
-    
-    # 4. Skor komposit dengan bobot
+
+    # 4. Composite
     df['composite_score'] = (
         df['value_score'] * FACTOR_WEIGHTS['value'] +
         df['quality_score'] * FACTOR_WEIGHTS['quality'] +
@@ -176,91 +206,75 @@ def calculate_scores(df):
         df['sentiment_score_final'] * FACTOR_WEIGHTS['sentiment'] +
         df['low_vol_score_final'] * FACTOR_WEIGHTS['low_vol']
     )
-    
-    # 5. Rating 1-100
     df['rating'] = df['composite_score'].round(1)
-    
     return df
 
 # ============================================================
-# STEP 4: MAIN PIPELINE (OTOMATIS, TANPA INPUT MANUAL)
+# STEP 5: PIPELINE
 # ============================================================
-def run_full_screener(top_n=20):
-    """Jalankan screener untuk seluruh S&P 500."""
-    print("Mengambil daftar S&P 500...")
-    tickers = get_sp500_tickers()
-    print(f"Ditemukan {len(tickers)} saham. Mengambil data...")
-    
+def run_full_screener(tickers, progress_callback=None):
     results = []
+    total = len(tickers)
     for i, ticker in enumerate(tickers):
-        print(f"[{i+1}/{len(tickers)}] {ticker}...", end='\r')
+        if progress_callback:
+            progress_callback(i, total, ticker)
         data = fetch_stock_data(ticker)
         if data:
             results.append(data)
-    
-    print(f"\nBerhasil mengambil {len(results)} saham.")
+        time.sleep(0.3)
+
     df = pd.DataFrame(results)
-    
-    print("Menghitung skor...")
+    if df.empty:
+        return df
+
+    # Filter kesehatan keuangan SEBELUM scoring
+    df = df[
+        (df['altman_z'].isna() | (df['altman_z'] >= 1.8)) &
+        (df['debt_to_equity'].isna() | (df['debt_to_equity'] <= 300))
+    ].reset_index(drop=True)
+
     df = calculate_scores(df)
-    
-    # Ranking
     df = df.sort_values('composite_score', ascending=False).reset_index(drop=True)
     df['rank'] = range(1, len(df) + 1)
-    
-    # Output
-    cols = ['rank', 'ticker', 'sector', 'price', 'rating', 
-            'value_score', 'quality_score', 'momentum_score_final', 
-            'sentiment_score_final', 'low_vol_score_final']
-    
-    print(f"\n{'='*80}")
-    print(f"TOP {top_n} SAHAM BERDASARKAN SKOR KOMPOSIT (SECTOR-NEUTRAL)")
-    print(f"{'='*80}")
-    print(df[cols].head(top_n).to_string(index=False))
-    
     return df
 
-# Jalankan
-if __name__ == "__main__":
-    df_results = run_full_screener(top_n=20)
-    df_results.to_csv('stock_screener_pro.csv', index=False)
-    print("\nHasil disimpan ke stock_screener_pro.csv")
-    def calculate_altman_z(info):
-    """Hitung Altman Z-Score untuk risiko kebangkrutan."""
-    try:
-        wc = info.get('totalCurrentAssets', 0) - info.get('totalCurrentLiabilities', 0)
-        ta = info.get('totalAssets', 1)
-        re = info.get('retainedEarnings', 0)
-        ebit = info.get('ebit', 0)
-        mcap = info.get('marketCap', 0)
-        tl = info.get('totalLiabilities', 1)
-        sales = info.get('totalRevenue', 0)
-        
-        if ta <= 0 or tl <= 0:
-            return np.nan
-        
-        z = (1.2 * (wc/ta) + 1.4 * (re/ta) + 3.3 * (ebit/ta) + 
-             0.6 * (mcap/tl) + 1.0 * (sales/ta))
-        return z
-    except:
-        return np.nan
-    # Sebelum scoring, buang saham yang:
-# - Altman Z-Score < 1.8 (risiko bangkrut tinggi)
-# - Piotroski F-Score < 4 (fundamental memburuk)
-# - Debt/Equity > 3.0 (utang terlalu besar)
-df = df[df['altman_z'] >= 1.8]
-df = df[df['f_score'] >= 4]
-df = df[df['debt_to_equity'] <= 3.0]
-# Ganti ini:
-pe = info.get('trailingPE', np.nan)
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+st.set_page_config(page_title="US Stock Screener Pro", layout="wide")
+st.title("📊 US Stock Screener Pro")
 
-# Dengan ini:
-forward_pe = info.get('forwardPE', np.nan)
-trailing_pe = info.get('trailingPE', np.nan)
+with st.sidebar:
+    st.header("Pengaturan")
+    universe_size = st.slider("Jumlah saham di universe:", 50, 500, 100, step=50)
+    top_n = st.slider("Tampilkan Top N:", 5, 50, 20)
 
-# Earnings Revisions (data ini sangat berharga)
-eps_revisions = stock.eps_revisions  # DataFrame dengan kolom 'upLast7days', 'upLast30days', dll.
-if not eps_revisions.empty:
-    rev_30d = eps_revisions.iloc[0].get('upLast30days', 0) - eps_revisions.iloc[0].get('downLast30days', 0)
-else:
-    rev_30d = 0
+if st.button("🚀 Jalankan Screener"):
+    tickers = get_all_us_tickers(limit=universe_size)
+    st.info(f"Screening {len(tickers)} saham. Ini bisa memakan waktu beberapa menit...")
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    def update_progress(i, total, ticker):
+        progress_bar.progress((i + 1) / total)
+        status_text.text(f"[{i+1}/{total}] Fetching {ticker}...")
+
+    df_results = run_full_screener(tickers, progress_callback=update_progress)
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if df_results.empty:
+        st.error("Tidak ada data yang berhasil diambil.")
+    else:
+        st.success(f"Berhasil screening {len(df_results)} saham.")
+
+        cols = ['rank', 'ticker', 'sector', 'price', 'rating',
+                'value_score', 'quality_score', 'momentum_score_final',
+                'sentiment_score_final', 'low_vol_score_final']
+        st.subheader(f"Top {top_n} Saham")
+        st.dataframe(df_results[cols].head(top_n), use_container_width=True)
+
+        csv = df_results.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download CSV", csv, "screener_results.csv", "text/csv")
