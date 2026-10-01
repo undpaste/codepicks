@@ -186,6 +186,13 @@ def calculate_scores(df, weights):
     df['sentiment_score'] = sector_neutral_score(df, 'analyst_upside', ascending=False)
     df['short_score'] = sector_neutral_score(df, 'short_percent_float', ascending=True)
 
+    # Isi NaN dengan 50 (skor netral) agar tidak merusak composite score
+    score_cols = ['fpe_score', 'pb_score', 'ps_score', 'roe_score', 'roa_score',
+                  'margin_score', 'accruals_score', 'momentum_score', 'low_vol_score',
+                  'sentiment_score', 'short_score']
+    for col in score_cols:
+        df[col] = df[col].fillna(50)
+
     df['value_score'] = df['fpe_score']*0.5 + df['pb_score']*0.25 + df['ps_score']*0.25
     df['quality_score'] = (df['roe_score']*0.3 + df['roa_score']*0.2 +
                            df['margin_score']*0.3 + df['accruals_score']*0.2)
@@ -241,36 +248,6 @@ def run_full_screener(tickers, weights, progress_callback=None):
     df = df.sort_values('composite_score', ascending=False).reset_index(drop=True)
     df['rank'] = range(1, len(df) + 1)
     return df
-def calculate_scores(df, weights):
-    df = df.copy()
-
-    # ... (winsorize seperti sebelumnya) ...
-
-    df['fpe_score'] = sector_neutral_score(df, 'forward_pe', ascending=True)
-    df['pb_score'] = sector_neutral_score(df, 'pb', ascending=True)
-    df['ps_score'] = sector_neutral_score(df, 'ps', ascending=True)
-    df['roe_score'] = sector_neutral_score(df, 'roe', ascending=False)
-    df['roa_score'] = sector_neutral_score(df, 'roa', ascending=False)
-    df['margin_score'] = sector_neutral_score(df, 'margin', ascending=False)
-    df['accruals_score'] = sector_neutral_score(df, 'accruals', ascending=True)
-    df['momentum_score'] = sector_neutral_score(df, 'return_12_1', ascending=False)
-    df['low_vol_score'] = sector_neutral_score(df, 'volatility', ascending=True)
-    df['sentiment_score'] = sector_neutral_score(df, 'analyst_upside', ascending=False)
-    df['short_score'] = sector_neutral_score(df, 'short_percent_float', ascending=True)
-
-    # ⬇️⬇️⬇️ TAMBAHKAN BARIS INI ⬇️⬇️⬇️
-    # Isi NaN dengan 50 (skor netral) agar tidak merusak composite score
-    score_cols = ['fpe_score', 'pb_score', 'ps_score', 'roe_score', 'roa_score',
-                  'margin_score', 'accruals_score', 'momentum_score', 'low_vol_score',
-                  'sentiment_score', 'short_score']
-    for col in score_cols:
-        df[col] = df[col].fillna(50)
-    # ⬆️⬆️⬆️ SAMPAI SINI ⬆️⬆️⬆️
-
-    df['value_score'] = df['fpe_score']*0.5 + df['pb_score']*0.25 + df['ps_score']*0.25
-    df['quality_score'] = (df['roe_score']*0.3 + df['roa_score']*0.2 +
-                           df['margin_score']*0.3 + df['accruals_score']*0.2)
-    # ... dst ...
 
 # ============================================================
 # STREAMLIT UI
