@@ -5,29 +5,37 @@ import numpy as np
 import requests
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
+import random
 import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================
-# KONFIGURASI
+# KONFIGURASI STRATEGI
 # ============================================================
-FACTOR_WEIGHTS = {
-    'value': 0.25,
-    'quality': 0.30,
-    'momentum': 0.20,
-    'sentiment': 0.15,
-    'low_vol': 0.10
+STRATEGY_WEIGHTS = {
+    "⚖️ Balanced (default)": {
+        'value': 0.25, 'quality': 0.30, 'momentum': 0.20, 'sentiment': 0.15, 'low_vol': 0.10
+    },
+    "🏆 Quality Compounder": {
+        'value': 0.20, 'quality': 0.50, 'momentum': 0.10, 'sentiment': 0.10, 'low_vol': 0.10
+    },
+    "🚀 High-Growth Momentum": {
+        'value': 0.10, 'quality': 0.20, 'momentum': 0.45, 'sentiment': 0.20, 'low_vol': 0.05
+    },
+    "💰 Deep Value": {
+        'value': 0.50, 'quality': 0.25, 'momentum': 0.10, 'sentiment': 0.10, 'low_vol': 0.05
+    },
 }
-MAX_WORKERS = 5  # Jumlah thread paralel (sesuaikan: 5-8 aman)
-CACHE_TTL = 3600  # Cache 1 jam
+
+MAX_WORKERS = 5
+CACHE_TTL = 3600
+MIN_MARKET_CAP = 2_000_000_000  # Minimal $2B market cap
 
 # ============================================================
-# STEP 1: UNIVERSE (Wikipedia S&P 500, stabil)
+# UNIVERSE
 # ============================================================
-@st.cache_data(ttl=86400)  # Cache daftar ticker selama 1 hari
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_sp500_tickers():
-    """Ambil S&P 500 dari Wikipedia, fallback ke daftar hardcoded."""
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -39,13 +47,12 @@ def get_sp500_tickers():
         tables = pd.read_html(StringIO(response.text))
         tickers = tables[0]['Symbol'].tolist()
         tickers = [t.replace('.', '-') for t in tickers]
-        return tickers
+        return sorted(tickers)
     except Exception as e:
         st.warning(f"Wikipedia gagal ({e}). Pakai fallback S&P 100.")
         return get_fallback_tickers()
 
 def get_fallback_tickers():
-    """Fallback: 100 saham besar jika Wikipedia gagal."""
     return [
         'AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK-B','UNH','XOM',
         'JNJ','JPM','V','PG','MA','HD','CVX','MRK','ABBV','LLY','PEP','KO',
@@ -58,11 +65,17 @@ def get_fallback_tickers():
         'PANW','CRWD','DDOG','SNOW','ZS','NET'
     ]
 
+def sample_universe(all_tickers, size):
+    """Random sample dari seluruh universe dengan seed tetap (reproducible)."""
+    if size >= len(all_tickers):
+        return all_tickers
+    rng = random.Random(42)  # seed tetap -> hasil konsisten tiap run
+    return sorted(rng.sample(all_tickers, size))
+
 # ============================================================
-# STEP 2: HELPER — Altman Z-Score
+# HELPERS
 # ============================================================
 def calculate_altman_z(info):
-    """Hitung Altman Z-Score untuk risiko kebangkrutan."""
     try:
         wc = info.get('totalCurrentAssets', 0) - info.get('totalCurrentLiabilities', 0)
         ta = info.get('totalAssets', 1) or 1
@@ -71,22 +84,18 @@ def calculate_altman_z(info):
         mcap = info.get('marketCap', 0)
         tl = info.get('totalLiabilities', 1) or 1
         sales = info.get('totalRevenue', 0)
-
         if ta <= 0 or tl <= 0:
             return np.nan
-
-        z = (1.2 * (wc/ta) + 1.4 * (re/ta) + 3.3 * (ebit/ta) +
-             0.6 * (mcap/tl) + 1.0 * (sales/ta))
-        return z
+        return (1.2*(wc/ta) + 1.4*(re/ta) + 3.3*(ebit/ta) +
+                0.6*(mcap/tl) + 1.0*(sales/ta))
     except:
         return np.nan
 
 # ============================================================
-# STEP 3: FETCH DATA PER SAHAM
+# FETCH PER SAHAM (cached)
 # ============================================================
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_stock_data(ticker):
-    """Fetch data fundamental, harga, dan sentimen untuk satu saham."""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -95,11 +104,14 @@ def fetch_stock_data(ticker):
         if hist.empty or len(hist) < 300:
             return None
 
+        market_cap = info.get('marketCap', np.nan)
+        if market_cap and market_cap < MIN_MARKET_CAP:
+            return None
+
         forward_pe = info.get('forwardPE', np.nan)
         trailing_pe = info.get('trailingPE', np.nan)
         pb = info.get('priceToBook', np.nan)
         ps = info.get('priceToSalesTrailing12Months', np.nan)
-
         roe = info.get('returnOnEquity', np.nan)
         roa = info.get('returnOnAssets', np.nan)
         margin = info.get('operatingMargins', np.nan)
@@ -127,11 +139,12 @@ def fetch_stock_data(ticker):
 
         short_ratio = info.get('shortRatio', np.nan)
         short_percent_float = info.get('shortPercentOfFloat', np.nan)
-
         sector = info.get('sector', 'Unknown')
+        name = info.get('shortName', ticker)
 
         return {
-            'ticker': ticker, 'sector': sector, 'price': current_price,
+            'ticker': ticker, 'name': name, 'sector': sector,
+            'price': current_price, 'market_cap': market_cap,
             'forward_pe': forward_pe, 'trailing_pe': trailing_pe,
             'pb': pb, 'ps': ps, 'roe': roe, 'roa': roa, 'margin': margin,
             'accruals': accruals, 'altman_z': altman_z,
@@ -139,11 +152,11 @@ def fetch_stock_data(ticker):
             'volatility': volatility_1y, 'analyst_upside': analyst_upside,
             'short_ratio': short_ratio, 'short_percent_float': short_percent_float,
         }
-    except Exception as e:
+    except Exception:
         return None
 
 # ============================================================
-# STEP 4: SCORING
+# SCORING
 # ============================================================
 def winsorize(series, lower=0.01, upper=0.99):
     return series.clip(series.quantile(lower), series.quantile(upper))
@@ -151,7 +164,7 @@ def winsorize(series, lower=0.01, upper=0.99):
 def sector_neutral_score(df, column, ascending=True):
     return df.groupby('sector')[column].rank(pct=True, ascending=ascending) * 100
 
-def calculate_scores(df):
+def calculate_scores(df, weights):
     df = df.copy()
 
     numeric_cols = ['forward_pe', 'trailing_pe', 'pb', 'ps', 'roe', 'roa',
@@ -164,52 +177,42 @@ def calculate_scores(df):
     df['fpe_score'] = sector_neutral_score(df, 'forward_pe', ascending=True)
     df['pb_score'] = sector_neutral_score(df, 'pb', ascending=True)
     df['ps_score'] = sector_neutral_score(df, 'ps', ascending=True)
-
     df['roe_score'] = sector_neutral_score(df, 'roe', ascending=False)
     df['roa_score'] = sector_neutral_score(df, 'roa', ascending=False)
     df['margin_score'] = sector_neutral_score(df, 'margin', ascending=False)
     df['accruals_score'] = sector_neutral_score(df, 'accruals', ascending=True)
-
     df['momentum_score'] = sector_neutral_score(df, 'return_12_1', ascending=False)
     df['low_vol_score'] = sector_neutral_score(df, 'volatility', ascending=True)
     df['sentiment_score'] = sector_neutral_score(df, 'analyst_upside', ascending=False)
     df['short_score'] = sector_neutral_score(df, 'short_percent_float', ascending=True)
 
-    df['value_score'] = df['fpe_score'] * 0.5 + df['pb_score'] * 0.25 + df['ps_score'] * 0.25
-    df['quality_score'] = (df['roe_score'] * 0.3 + df['roa_score'] * 0.2 +
-                           df['margin_score'] * 0.3 + df['accruals_score'] * 0.2)
+    df['value_score'] = df['fpe_score']*0.5 + df['pb_score']*0.25 + df['ps_score']*0.25
+    df['quality_score'] = (df['roe_score']*0.3 + df['roa_score']*0.2 +
+                           df['margin_score']*0.3 + df['accruals_score']*0.2)
     df['momentum_score_final'] = df['momentum_score']
-    df['sentiment_score_final'] = df['sentiment_score'] * 0.7 + df['short_score'] * 0.3
+    df['sentiment_score_final'] = df['sentiment_score']*0.7 + df['short_score']*0.3
     df['low_vol_score_final'] = df['low_vol_score']
 
     df['composite_score'] = (
-        df['value_score'] * FACTOR_WEIGHTS['value'] +
-        df['quality_score'] * FACTOR_WEIGHTS['quality'] +
-        df['momentum_score_final'] * FACTOR_WEIGHTS['momentum'] +
-        df['sentiment_score_final'] * FACTOR_WEIGHTS['sentiment'] +
-        df['low_vol_score_final'] * FACTOR_WEIGHTS['low_vol']
+        df['value_score']*weights['value'] +
+        df['quality_score']*weights['quality'] +
+        df['momentum_score_final']*weights['momentum'] +
+        df['sentiment_score_final']*weights['sentiment'] +
+        df['low_vol_score_final']*weights['low_vol']
     )
     df['rating'] = df['composite_score'].round(1)
     return df
 
 # ============================================================
-# STEP 5: PIPELINE DENGAN MULTITHREADING
+# PIPELINE
 # ============================================================
-def run_full_screener(tickers, progress_callback=None):
-    """
-    Jalankan screener dengan multithreading (tanpa caching di level ini).
-    Progress dilaporkan via callback.
-    """
+def run_full_screener(tickers, weights, progress_callback=None):
     results = []
     total = len(tickers)
     completed = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_ticker = {
-            executor.submit(fetch_stock_data, ticker): ticker
-            for ticker in tickers
-        }
-
+        future_to_ticker = {executor.submit(fetch_stock_data, t): t for t in tickers}
         for future in as_completed(future_to_ticker):
             ticker = future_to_ticker[future]
             completed += 1
@@ -219,8 +222,6 @@ def run_full_screener(tickers, progress_callback=None):
                     results.append(data)
             except Exception:
                 pass
-
-            # Update progress via callback
             if progress_callback:
                 progress_callback(completed, total, ticker)
 
@@ -228,7 +229,6 @@ def run_full_screener(tickers, progress_callback=None):
     if df.empty:
         return df
 
-    # Filter kesehatan keuangan SEBELUM scoring
     df = df[
         (df['altman_z'].isna() | (df['altman_z'] >= 1.8)) &
         (df['debt_to_equity'].isna() | (df['debt_to_equity'] <= 300))
@@ -237,7 +237,7 @@ def run_full_screener(tickers, progress_callback=None):
     if df.empty:
         return df
 
-    df = calculate_scores(df)
+    df = calculate_scores(df, weights)
     df = df.sort_values('composite_score', ascending=False).reset_index(drop=True)
     df['rank'] = range(1, len(df) + 1)
     return df
@@ -247,22 +247,36 @@ def run_full_screener(tickers, progress_callback=None):
 # ============================================================
 st.set_page_config(page_title="US Stock Screener Pro", layout="wide")
 st.title("📊 US Stock Screener Pro")
-st.caption(f"⚡ Multithreading aktif ({MAX_WORKERS} thread) | 💾 Cache {CACHE_TTL//60} menit")
+st.caption(f"⚡ {MAX_WORKERS} thread paralel | 💾 Cache {CACHE_TTL//60} menit | 🏦 Min. Market Cap ${MIN_MARKET_CAP/1e9:.0f}B")
 
 with st.sidebar:
-    st.header("Pengaturan")
+    st.header("⚙️ Pengaturan")
+
+    strategy = st.selectbox("Pilih strategi:", list(STRATEGY_WEIGHTS.keys()))
+    weights = STRATEGY_WEIGHTS[strategy]
+
     universe_size = st.slider(
-        "Jumlah saham di universe (S&P 500):",
-        min_value=50, max_value=500, value=100, step=50,
-        help="Semakin banyak saham, semakin lama prosesnya."
+        "Jumlah saham di universe (dari S&P 500):",
+        min_value=50, max_value=500, value=200, step=50,
+        help="Random sample dari 500 saham S&P. Hasil konsisten tiap run."
     )
     top_n = st.slider("Tampilkan Top N:", 5, 50, 20)
 
-if st.button("🚀 Jalankan Screener", type="primary"):
-    tickers = get_sp500_tickers()
-    tickers = tickers[:universe_size]
+    st.divider()
+    st.caption(f"**Bobot strategi:**")
+    st.caption(f"Value {weights['value']*100:.0f}% | Quality {weights['quality']*100:.0f}% | Momentum {weights['momentum']*100:.0f}% | Sentiment {weights['sentiment']*100:.0f}% | Low Vol {weights['low_vol']*100:.0f}%")
 
-    st.info(f"Screening {len(tickers)} saham dengan {MAX_WORKERS} thread paralel...")
+    st.divider()
+    if st.button("🗑️ Clear Cache"):
+        st.cache_data.clear()
+        st.success("Cache dibersihkan. Data akan di-fetch ulang.")
+        st.rerun()
+
+if st.button("🚀 Jalankan Screener", type="primary"):
+    all_tickers = get_sp500_tickers()
+    tickers = sample_universe(all_tickers, universe_size)
+
+    st.info(f"Screening **{len(tickers)} saham** (random sample dari {len(all_tickers)}) dengan strategi **{strategy}**...")
 
     progress_bar = st.progress(0, text="Memulai...")
 
@@ -272,22 +286,46 @@ if st.button("🚀 Jalankan Screener", type="primary"):
             text=f"[{completed}/{total}] Selesai: {ticker}"
         )
 
-    df_results = run_full_screener(tickers, progress_callback=update_progress)
-
+    df_results = run_full_screener(tickers, weights, progress_callback=update_progress)
     progress_bar.empty()
 
     if df_results.empty:
-        st.error("Tidak ada data yang berhasil diambil. Coba kurangi jumlah saham.")
+        st.error("Tidak ada data yang berhasil diambil. Coba kurangi jumlah saham atau tunggu beberapa menit.")
     else:
-        st.success(f"✅ Berhasil screening {len(df_results)} saham dari {len(tickers)} yang diminta.")
+        st.success(f"✅ Berhasil screening **{len(df_results)} saham** dari {len(tickers)} yang diminta.")
 
-        cols = ['rank', 'ticker', 'sector', 'price', 'rating',
-                'value_score', 'quality_score', 'momentum_score_final',
-                'sentiment_score_final', 'low_vol_score_final']
-        st.subheader(f"Top {top_n} Saham")
-        st.dataframe(df_results[cols].head(top_n), use_container_width=True)
+        # ============ TABEL UTAMA ============
+        st.subheader(f"🏆 Top {top_n} Saham — {strategy}")
 
-        # Detail skor
+        display_df = df_results.head(top_n)[[
+            'rank', 'ticker', 'name', 'sector', 'price', 'market_cap',
+            'rating', 'forward_pe', 'roe', 'return_12_1',
+            'value_score', 'quality_score', 'momentum_score_final',
+            'sentiment_score_final', 'low_vol_score_final'
+        ]].copy()
+
+        # Format angka
+        display_df['price'] = display_df['price'].apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "-")
+        display_df['market_cap'] = display_df['market_cap'].apply(lambda x: f"${x/1e9:.1f}B" if pd.notna(x) else "-")
+        display_df['forward_pe'] = display_df['forward_pe'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+        display_df['roe'] = display_df['roe'].apply(lambda x: f"{x*100:.1f}%" if pd.notna(x) else "-")
+        display_df['return_12_1'] = display_df['return_12_1'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "-")
+        for col in ['rating', 'value_score', 'quality_score', 'momentum_score_final',
+                    'sentiment_score_final', 'low_vol_score_final']:
+            display_df[col] = display_df[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+
+        display_df.columns = ['Rank', 'Ticker', 'Nama', 'Sektor', 'Harga', 'Mkt Cap',
+                              'Rating', 'Fwd P/E', 'ROE', 'Ret 12-1',
+                              'Value', 'Quality', 'Momentum', 'Sentiment', 'Low Vol']
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # ============ BREAKDOWN PER SEKTOR ============
+        st.subheader("🏭 Distribusi Sektor di Top Picks")
+        sector_counts = df_results.head(top_n)['sector'].value_counts()
+        st.bar_chart(sector_counts)
+
+        # ============ BREAKDOWN SKOR ============
         st.subheader("📊 Breakdown Skor per Faktor")
         chart_data = df_results.head(top_n).set_index('ticker')[
             ['value_score', 'quality_score', 'momentum_score_final',
@@ -295,5 +333,6 @@ if st.button("🚀 Jalankan Screener", type="primary"):
         ]
         st.bar_chart(chart_data)
 
+        # ============ DOWNLOAD ============
         csv = df_results.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download CSV", csv, "screener_results.csv", "text/csv")
+        st.download_button("📥 Download CSV (semua hasil)", csv, "screener_results.csv", "text/csv")
