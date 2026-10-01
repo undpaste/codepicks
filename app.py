@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+import time
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
@@ -27,9 +28,18 @@ STRATEGY_WEIGHTS = {
     },
 }
 
-MAX_WORKERS = 5
+MAX_WORKERS = 3  # FIX: diturunin dari 5 -> 3, lebih aman dari rate limit Yahoo
 CACHE_TTL = 3600
 MIN_MARKET_CAP = 2_000_000_000
+RETRY_ATTEMPTS = 3  # FIX: retry kalau fetch gagal (bisa jadi rate limit, bukan beneran gak ada data)
+
+# FIX: sektor yang gak cocok dievaluasi pakai Altman Z-score klasik
+# (formula aslinya buat manufaktur; current assets/liabilities bank & REIT strukturnya beda)
+Z_SCORE_EXEMPT_SECTORS = {'Financial Services', 'Real Estate'}
+
+# FIX: ambang batas buat nandain return yang ekstrem di UI (bukan di-exclude, cuma di-flag)
+EXTREME_RETURN_12M_THRESHOLD = 200   # %
+EXTREME_RETURN_6M_THRESHOLD = 150    # %
 
 # ============================================================
 # UNIVERSE
@@ -45,8 +55,15 @@ def get_sp500_tickers():
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         tables = pd.read_html(StringIO(response.text))
-        tickers = tables[0]['Symbol'].tolist()
-        tickers = [t.replace('.', '-') for t in tickers]
+        raw_tickers = tables[0]['Symbol'].tolist()
+        # FIX: strip whitespace & drop kosong/duplikat biar gak ada entri aneh
+        tickers = []
+        seen = set()
+        for t in raw_tickers:
+            t = str(t).strip().replace('.', '-')
+            if t and t not in seen:
+                tickers.append(t)
+                seen.add(t)
         return sorted(tickers)
     except Exception as e:
         st.warning(f"Wikipedia gagal ({e}). Pakai fallback S&P 100.")
@@ -65,8 +82,9 @@ def get_fallback_tickers():
         'PANW','CRWD','DDOG','SNOW','ZS','NET'
     ]
 
-def sample_universe(all_tickers, size):
-    if size >= len(all_tickers):
+def sample_universe(all_tickers, size, use_full):
+    # FIX: opsi screening penuh, bukan selalu random sample
+    if use_full or size >= len(all_tickers):
         return all_tickers
     rng = random.Random(42)
     return rng.sample(all_tickers, size)
@@ -74,7 +92,10 @@ def sample_universe(all_tickers, size):
 # ============================================================
 # HELPERS
 # ============================================================
-def calculate_altman_z(info):
+def calculate_altman_z(info, sector):
+    # FIX: skip Altman Z buat sektor yang gak cocok sama modelnya (return NaN = otomatis lolos filter)
+    if sector in Z_SCORE_EXEMPT_SECTORS:
+        return np.nan
     try:
         wc = info.get('totalCurrentAssets', 0) - info.get('totalCurrentLiabilities', 0)
         ta = info.get('totalAssets', 1) or 1
@@ -87,8 +108,19 @@ def calculate_altman_z(info):
             return np.nan
         return (1.2*(wc/ta) + 1.4*(re/ta) + 3.3*(ebit/ta) +
                 0.6*(mcap/tl) + 1.0*(sales/ta))
-    except:
+    except Exception:
         return np.nan
+
+def fetch_with_retry(fn, *args, attempts=RETRY_ATTEMPTS, **kwargs):
+    # FIX: retry dengan backoff + jitter, biar rate-limit sementara gak langsung dianggap "no data"
+    last_err = None
+    for i in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            time.sleep((1.5 ** i) + random.uniform(0, 0.4))
+    raise last_err
 
 # ============================================================
 # FETCH PER SAHAM (cached)
@@ -96,9 +128,12 @@ def calculate_altman_z(info):
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_stock_data(ticker):
     try:
+        # FIX: delay kecil acak sebelum tiap request, biar burst request ke Yahoo lebih halus
+        time.sleep(random.uniform(0.05, 0.2))
+
         stock = yf.Ticker(ticker)
-        info = stock.info
-        hist = stock.history(period='2y')
+        info = fetch_with_retry(lambda: stock.info)
+        hist = fetch_with_retry(lambda: stock.history(period='2y'))
 
         if hist.empty or len(hist) < 300:
             return None
@@ -106,6 +141,10 @@ def fetch_stock_data(ticker):
         market_cap = info.get('marketCap', np.nan)
         if market_cap and market_cap < MIN_MARKET_CAP:
             return None
+
+        sector = info.get('sector') or 'Unknown'
+        if sector in ('Unknown', '', None):
+            sector = 'Other'
 
         # --- Fundamental ---
         forward_pe = info.get('forwardPE', np.nan)
@@ -121,7 +160,7 @@ def fetch_stock_data(ticker):
         total_assets = info.get('totalAssets', np.nan)
         accruals = (net_income - cfo) / total_assets if total_assets and total_assets > 0 else np.nan
 
-        altman_z = calculate_altman_z(info)
+        altman_z = calculate_altman_z(info, sector)  # FIX: pass sector buat exempt check
         debt_to_equity = info.get('debtToEquity', np.nan)
 
         # --- Revenue Growth ---
@@ -144,6 +183,12 @@ def fetch_stock_data(ticker):
         else:
             return_6m = np.nan
 
+        # FIX: flag return ekstrem (bukan dibuang, cuma ditandai di UI buat sanity-check manual)
+        extreme_move = bool(
+            (pd.notna(return_12_1) and abs(return_12_1) > EXTREME_RETURN_12M_THRESHOLD) or
+            (pd.notna(return_6m) and abs(return_6m) > EXTREME_RETURN_6M_THRESHOLD)
+        )
+
         daily_returns = close.pct_change().dropna()
         volatility_1y = daily_returns.tail(252).std() * np.sqrt(252) * 100
 
@@ -152,11 +197,6 @@ def fetch_stock_data(ticker):
         analyst_upside = ((target_mean / current_price) - 1) * 100 if target_mean and current_price else np.nan
         short_ratio = info.get('shortRatio', np.nan)
         short_percent_float = info.get('shortPercentOfFloat', np.nan)
-
-        # --- Sector dengan fallback ---
-        sector = info.get('sector') or 'Unknown'
-        if sector in ('Unknown', '', None):
-            sector = 'Other'
 
         name = info.get('shortName', ticker)
 
@@ -173,6 +213,7 @@ def fetch_stock_data(ticker):
             'analyst_upside': analyst_upside,
             'short_ratio': short_ratio, 'short_percent_float': short_percent_float,
             'rev_growth': rev_growth,
+            'extreme_move': extreme_move,  # FIX
         }
     except Exception:
         return None
@@ -189,7 +230,6 @@ def sector_neutral_score(df, column, ascending=True):
 def calculate_scores(df, weights):
     df = df.copy()
 
-    # --- Cap revenue growth (M&A noise) ---
     if 'rev_growth' in df.columns:
         df['rev_growth'] = df['rev_growth'].clip(upper=2.0)
 
@@ -216,11 +256,9 @@ def calculate_scores(df, weights):
                   'margin_score', 'accruals_score', 'momentum_score', 'low_vol_score',
                   'sentiment_score', 'short_score']
 
-    # Fill NaN dengan 50 (netral)
     for col in score_cols:
         df[col] = df[col].fillna(50)
 
-    # Override sector 'Other' jadi netral 50
     mask_other = df['sector'] == 'Other'
     for col in score_cols:
         df.loc[mask_other, col] = 50
@@ -245,7 +283,7 @@ def calculate_scores(df, weights):
 # ============================================================
 # PIPELINE
 # ============================================================
-def run_full_screener(tickers, weights, progress_callback=None):
+def run_full_screener(tickers, weights, strategy_name, progress_callback=None):
     results = []
     total = len(tickers)
     completed = 0
@@ -265,8 +303,14 @@ def run_full_screener(tickers, weights, progress_callback=None):
                 progress_callback(completed, total, ticker)
 
     df = pd.DataFrame(results)
+    # FIX: hitung berapa ticker yang gagal total (bukan cuma kefilter), biar transparan ke user
+    n_fetched = len(df)
+    n_failed = total - n_fetched
+
     if df.empty:
-        return df
+        return df, n_failed, 0, 0
+
+    n_before_filters = len(df)
 
     # --- Filter 1: Kesehatan keuangan ---
     df = df[
@@ -274,33 +318,50 @@ def run_full_screener(tickers, weights, progress_callback=None):
         (df['debt_to_equity'].isna() | (df['debt_to_equity'] <= 300))
     ].reset_index(drop=True)
 
+    n_after_health = len(df)
+
     if df.empty:
-        return df
+        return df, n_failed, n_before_filters - n_after_health, 0
 
     # --- Filter 2: Falling Knife Guard ---
-    df = df[
-        (df['return_6m'].isna() | (df['return_6m'] > -25)) &
-        (
-            (df['above_sma200'] == True) |
-            (df['return_6m'].isna()) |
-            (df['return_6m'] > -10)
-        )
-    ].reset_index(drop=True)
+    # FIX: strategi Deep Value butuh filter yang lebih longgar - justru nyari saham yang udah jatuh
+    if strategy_name == "💰 Deep Value":
+        drawdown_limit = -50
+        require_trend = False
+    else:
+        drawdown_limit = -25
+        require_trend = True
+
+    if require_trend:
+        df = df[
+            (df['return_6m'].isna() | (df['return_6m'] > drawdown_limit)) &
+            (
+                (df['above_sma200'] == True) |
+                (df['return_6m'].isna()) |
+                (df['return_6m'] > -10)
+            )
+        ].reset_index(drop=True)
+    else:
+        df = df[
+            (df['return_6m'].isna() | (df['return_6m'] > drawdown_limit))
+        ].reset_index(drop=True)
+
+    n_after_knife = len(df)
 
     if df.empty:
-        return df
+        return df, n_failed, n_before_filters - n_after_health, n_after_health - n_after_knife
 
     df = calculate_scores(df, weights)
     df = df.sort_values('composite_score', ascending=False).reset_index(drop=True)
     df['rank'] = range(1, len(df) + 1)
-    return df
+    return df, n_failed, n_before_filters - n_after_health, n_after_health - n_after_knife
 
 # ============================================================
 # STREAMLIT UI
 # ============================================================
 st.set_page_config(page_title="US Stock Screener Pro", layout="wide")
 st.title("📊 US Stock Screener Pro")
-st.caption(f"⚡ {MAX_WORKERS} thread paralel | 💾 Cache {CACHE_TTL//60} menit | 🏦 Min. Market Cap ${MIN_MARKET_CAP/1e9:.0f}B")
+st.caption(f"⚡ {MAX_WORKERS} thread paralel (+retry) | 💾 Cache {CACHE_TTL//60} menit | 🏦 Min. Market Cap ${MIN_MARKET_CAP/1e9:.0f}B")
 
 with st.sidebar:
     st.header("⚙️ Pengaturan")
@@ -308,16 +369,29 @@ with st.sidebar:
     strategy = st.selectbox("Pilih strategi:", list(STRATEGY_WEIGHTS.keys()))
     weights = STRATEGY_WEIGHTS[strategy]
 
-    universe_size = st.slider(
-        "Jumlah saham di universe (dari S&P 500):",
-        min_value=50, max_value=500, value=200, step=50,
-        help="Random sample dari 500 saham S&P. Hasil konsisten tiap run."
+    # FIX: opsi eksplisit buat screening SEMUA saham, bukan cuma random sample
+    use_full_universe = st.checkbox(
+        "Screening semua ~500 saham S&P 500 (lebih lambat & lengkap)",
+        value=False,
+        help="Kalau dimatikan, hasil cuma diambil dari random sample di bawah (sample-nya tetap/fixed, bukan seluruh index)."
     )
+
+    universe_size = st.slider(
+        "Jumlah saham di universe (kalau bukan full screening):",
+        min_value=50, max_value=500, value=200, step=50,
+        disabled=use_full_universe,
+        help="Random sample dari S&P 500 dengan seed tetap (hasil konsisten tiap run, tapi BUKAN keseluruhan index)."
+    )
+    if not use_full_universe:
+        st.caption("⚠️ Ini sample, bukan screening keseluruhan S&P 500. Centang opsi di atas buat hasil yang mencakup semua saham.")
+
     top_n = st.slider("Tampilkan Top N:", 5, 50, 20)
 
     st.divider()
     st.caption(f"**Bobot strategi:**")
     st.caption(f"Value {weights['value']*100:.0f}% | Quality {weights['quality']*100:.0f}% | Momentum {weights['momentum']*100:.0f}% | Sentiment {weights['sentiment']*100:.0f}% | Low Vol {weights['low_vol']*100:.0f}%")
+    if strategy == "💰 Deep Value":
+        st.caption("ℹ️ Falling Knife Guard dilonggarkan buat strategi ini (threshold -50% & gak wajib above SMA200), karena Deep Value memang nyari saham yang udah terkoreksi.")
 
     st.divider()
     if st.button("🗑️ Clear Cache"):
@@ -327,9 +401,17 @@ with st.sidebar:
 
 if st.button("🚀 Jalankan Screener", type="primary"):
     all_tickers = get_sp500_tickers()
-    tickers = sample_universe(all_tickers, universe_size)
 
-    st.info(f"Screening **{len(tickers)} saham** (random sample dari {len(all_tickers)}) dengan strategi **{strategy}**...")
+    # FIX: sanity check ticker list - flag ticker 1 karakter buat di-review manual
+    # (bukan di-exclude otomatis, karena beberapa ticker 1 huruf itu valid: F, T, V, C, dll)
+    single_char = [t for t in all_tickers if len(t) == 1]
+    st.caption(f"📋 {len(all_tickers)} ticker dimuat dari S&P 500.")
+    if single_char:
+        st.caption(f"🔍 Ticker 1-huruf yang ke-load: {', '.join(single_char)} — kalau ada yang gak familiar, cek manual, kemungkinan sisa parsing tabel Wikipedia yang keliru.")
+
+    tickers = sample_universe(all_tickers, universe_size, use_full_universe)
+
+    st.info(f"Screening **{len(tickers)} saham** dengan strategi **{strategy}**...")
 
     progress_bar = st.progress(0, text="Memulai...")
 
@@ -339,13 +421,23 @@ if st.button("🚀 Jalankan Screener", type="primary"):
             text=f"[{completed}/{total}] Selesai: {ticker}"
         )
 
-    df_results = run_full_screener(tickers, weights, progress_callback=update_progress)
+    df_results, n_failed, n_filtered_health, n_filtered_knife = run_full_screener(
+        tickers, weights, strategy, progress_callback=update_progress
+    )
     progress_bar.empty()
 
     if df_results.empty:
-        st.error("Tidak ada data yang berhasil diambil. Coba kurangi jumlah saham atau tunggu beberapa menit.")
+        st.error("Tidak ada data yang berhasil diambil. Coba kurangi jumlah saham atau tunggu beberapa menit (kemungkinan kena rate limit Yahoo Finance).")
     else:
-        st.success(f"✅ Berhasil screening **{len(df_results)} saham** dari {len(tickers)} yang diminta.")
+        st.success(f"✅ Berhasil screening **{len(df_results)} saham** lolos semua filter, dari {len(tickers)} yang diminta.")
+
+        # FIX: transparansi funnel - biar user tau kenapa hasil akhir sedikit
+        with st.expander("ℹ️ Detail funnel screening (kenapa jumlahnya segini)"):
+            st.write(f"- Diminta: {len(tickers)} ticker")
+            st.write(f"- Gagal di-fetch (rate limit / data kosong / market cap kekecilan): {n_failed}")
+            st.write(f"- Tersaring filter kesehatan keuangan (Altman Z / Debt-to-Equity): {n_filtered_health}")
+            st.write(f"- Tersaring Falling Knife Guard: {n_filtered_knife}")
+            st.write(f"- **Lolos semua filter: {len(df_results)}**")
 
         # ============ TABEL UTAMA ============
         st.subheader(f"🏆 Top {top_n} Saham — {strategy}")
@@ -354,10 +446,15 @@ if st.button("🚀 Jalankan Screener", type="primary"):
             'rank', 'ticker', 'name', 'sector', 'price', 'market_cap',
             'rating', 'forward_pe', 'roe', 'return_12_1', 'return_6m',
             'value_score', 'quality_score', 'momentum_score_final',
-            'sentiment_score_final', 'low_vol_score_final'
+            'sentiment_score_final', 'low_vol_score_final', 'extreme_move'
         ]].copy()
 
-        # Format angka
+        # FIX: tandain ticker dengan return ekstrem biar user sadar buat sanity-check manual
+        display_df['ticker'] = display_df.apply(
+            lambda r: f"⚠️ {r['ticker']}" if r['extreme_move'] else r['ticker'], axis=1
+        )
+        display_df = display_df.drop(columns=['extreme_move'])
+
         display_df['price'] = display_df['price'].apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "-")
         display_df['market_cap'] = display_df['market_cap'].apply(lambda x: f"${x/1e9:.1f}B" if pd.notna(x) else "-")
         display_df['forward_pe'] = display_df['forward_pe'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
@@ -373,6 +470,8 @@ if st.button("🚀 Jalankan Screener", type="primary"):
                               'Value', 'Quality', 'Momentum', 'Sentiment', 'Low Vol']
 
         st.dataframe(display_df, use_container_width=True, hide_index=True)
+        if df_results.head(top_n)['extreme_move'].any():
+            st.caption("⚠️ = return 12-1 bulan >200% atau return 6 bulan >150%. Bukan otomatis salah data, tapi worth di-cross-check manual ke sumber lain sebelum dipakai (bisa jadi rally beneran, bisa juga ada korporat aksi yang gak ke-handle sempurna).")
 
         # ============ BREAKDOWN PER SEKTOR ============
         st.subheader("🏭 Distribusi Sektor di Top Picks")
