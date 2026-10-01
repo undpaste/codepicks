@@ -29,7 +29,7 @@ STRATEGY_WEIGHTS = {
 
 MAX_WORKERS = 5
 CACHE_TTL = 3600
-MIN_MARKET_CAP = 2_000_000_000  # Minimal $2B market cap
+MIN_MARKET_CAP = 2_000_000_000
 
 # ============================================================
 # UNIVERSE
@@ -66,10 +66,9 @@ def get_fallback_tickers():
     ]
 
 def sample_universe(all_tickers, size):
-    """Random sample dari seluruh universe dengan seed tetap (reproducible)."""
     if size >= len(all_tickers):
         return all_tickers
-    rng = random.Random(42)  # seed tetap -> hasil konsisten tiap run
+    rng = random.Random(42)
     return rng.sample(all_tickers, size)
 
 # ============================================================
@@ -108,6 +107,7 @@ def fetch_stock_data(ticker):
         if market_cap and market_cap < MIN_MARKET_CAP:
             return None
 
+        # --- Fundamental ---
         forward_pe = info.get('forwardPE', np.nan)
         trailing_pe = info.get('trailingPE', np.nan)
         pb = info.get('priceToBook', np.nan)
@@ -124,22 +124,40 @@ def fetch_stock_data(ticker):
         altman_z = calculate_altman_z(info)
         debt_to_equity = info.get('debtToEquity', np.nan)
 
+        # --- Revenue Growth ---
+        rev_growth = info.get('revenueGrowth', np.nan)
+
+        # --- Harga & Momentum ---
         close = hist['Close']
+        current_price = close.iloc[-1]
+
+        sma_200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
+        above_sma200 = bool(current_price > sma_200) if pd.notna(sma_200) else True
+
         if len(close) >= 273:
             return_12_1 = (close.iloc[-22] / close.iloc[-273] - 1) * 100
         else:
             return_12_1 = np.nan
 
+        if len(close) >= 126:
+            return_6m = (close.iloc[-1] / close.iloc[-126] - 1) * 100
+        else:
+            return_6m = np.nan
+
         daily_returns = close.pct_change().dropna()
         volatility_1y = daily_returns.tail(252).std() * np.sqrt(252) * 100
 
+        # --- Sentiment & Short ---
         target_mean = info.get('targetMeanPrice', np.nan)
-        current_price = close.iloc[-1]
         analyst_upside = ((target_mean / current_price) - 1) * 100 if target_mean and current_price else np.nan
-
         short_ratio = info.get('shortRatio', np.nan)
         short_percent_float = info.get('shortPercentOfFloat', np.nan)
-        sector = info.get('sector', 'Unknown')
+
+        # --- Sector dengan fallback ---
+        sector = info.get('sector') or 'Unknown'
+        if sector in ('Unknown', '', None):
+            sector = 'Other'
+
         name = info.get('shortName', ticker)
 
         return {
@@ -148,9 +166,13 @@ def fetch_stock_data(ticker):
             'forward_pe': forward_pe, 'trailing_pe': trailing_pe,
             'pb': pb, 'ps': ps, 'roe': roe, 'roa': roa, 'margin': margin,
             'accruals': accruals, 'altman_z': altman_z,
-            'debt_to_equity': debt_to_equity, 'return_12_1': return_12_1,
-            'volatility': volatility_1y, 'analyst_upside': analyst_upside,
+            'debt_to_equity': debt_to_equity,
+            'return_12_1': return_12_1, 'return_6m': return_6m,
+            'above_sma200': above_sma200,
+            'volatility': volatility_1y,
+            'analyst_upside': analyst_upside,
             'short_ratio': short_ratio, 'short_percent_float': short_percent_float,
+            'rev_growth': rev_growth,
         }
     except Exception:
         return None
@@ -166,6 +188,10 @@ def sector_neutral_score(df, column, ascending=True):
 
 def calculate_scores(df, weights):
     df = df.copy()
+
+    # --- Cap revenue growth (M&A noise) ---
+    if 'rev_growth' in df.columns:
+        df['rev_growth'] = df['rev_growth'].clip(upper=2.0)
 
     numeric_cols = ['forward_pe', 'trailing_pe', 'pb', 'ps', 'roe', 'roa',
                     'margin', 'accruals', 'return_12_1', 'volatility',
@@ -186,12 +212,18 @@ def calculate_scores(df, weights):
     df['sentiment_score'] = sector_neutral_score(df, 'analyst_upside', ascending=False)
     df['short_score'] = sector_neutral_score(df, 'short_percent_float', ascending=True)
 
-    # Isi NaN dengan 50 (skor netral) agar tidak merusak composite score
     score_cols = ['fpe_score', 'pb_score', 'ps_score', 'roe_score', 'roa_score',
                   'margin_score', 'accruals_score', 'momentum_score', 'low_vol_score',
                   'sentiment_score', 'short_score']
+
+    # Fill NaN dengan 50 (netral)
     for col in score_cols:
         df[col] = df[col].fillna(50)
+
+    # Override sector 'Other' jadi netral 50
+    mask_other = df['sector'] == 'Other'
+    for col in score_cols:
+        df.loc[mask_other, col] = 50
 
     df['value_score'] = df['fpe_score']*0.5 + df['pb_score']*0.25 + df['ps_score']*0.25
     df['quality_score'] = (df['roe_score']*0.3 + df['roa_score']*0.2 +
@@ -236,9 +268,23 @@ def run_full_screener(tickers, weights, progress_callback=None):
     if df.empty:
         return df
 
+    # --- Filter 1: Kesehatan keuangan ---
     df = df[
         (df['altman_z'].isna() | (df['altman_z'] >= 1.8)) &
         (df['debt_to_equity'].isna() | (df['debt_to_equity'] <= 300))
+    ].reset_index(drop=True)
+
+    if df.empty:
+        return df
+
+    # --- Filter 2: Falling Knife Guard ---
+    df = df[
+        (df['return_6m'].isna() | (df['return_6m'] > -25)) &
+        (
+            (df['above_sma200'] == True) |
+            (df['return_6m'].isna()) |
+            (df['return_6m'] > -10)
+        )
     ].reset_index(drop=True)
 
     if df.empty:
@@ -306,7 +352,7 @@ if st.button("🚀 Jalankan Screener", type="primary"):
 
         display_df = df_results.head(top_n)[[
             'rank', 'ticker', 'name', 'sector', 'price', 'market_cap',
-            'rating', 'forward_pe', 'roe', 'return_12_1',
+            'rating', 'forward_pe', 'roe', 'return_12_1', 'return_6m',
             'value_score', 'quality_score', 'momentum_score_final',
             'sentiment_score_final', 'low_vol_score_final'
         ]].copy()
@@ -317,12 +363,13 @@ if st.button("🚀 Jalankan Screener", type="primary"):
         display_df['forward_pe'] = display_df['forward_pe'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
         display_df['roe'] = display_df['roe'].apply(lambda x: f"{x*100:.1f}%" if pd.notna(x) else "-")
         display_df['return_12_1'] = display_df['return_12_1'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "-")
+        display_df['return_6m'] = display_df['return_6m'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "-")
         for col in ['rating', 'value_score', 'quality_score', 'momentum_score_final',
                     'sentiment_score_final', 'low_vol_score_final']:
             display_df[col] = display_df[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
 
         display_df.columns = ['Rank', 'Ticker', 'Nama', 'Sektor', 'Harga', 'Mkt Cap',
-                              'Rating', 'Fwd P/E', 'ROE', 'Ret 12-1',
+                              'Rating', 'Fwd P/E', 'ROE', 'Ret 12-1', 'Ret 6M',
                               'Value', 'Quality', 'Momentum', 'Sentiment', 'Low Vol']
 
         st.dataframe(display_df, use_container_width=True, hide_index=True)
