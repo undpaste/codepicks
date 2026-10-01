@@ -84,6 +84,7 @@ def calculate_altman_z(info):
 # ============================================================
 # STEP 3: FETCH DATA PER SAHAM
 # ============================================================
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_stock_data(ticker):
     """Fetch data fundamental, harga, dan sentimen untuk satu saham."""
     try:
@@ -194,17 +195,15 @@ def calculate_scores(df):
 # ============================================================
 # STEP 5: PIPELINE DENGAN MULTITHREADING
 # ============================================================
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def run_full_screener(tickers, progress_container=None):
+def run_full_screener(tickers, progress_callback=None):
     """
-    Jalankan screener dengan multithreading.
-    Mengembalikan DataFrame hasil scoring.
+    Jalankan screener dengan multithreading (tanpa caching di level ini).
+    Progress dilaporkan via callback.
     """
     results = []
     total = len(tickers)
     completed = 0
 
-    # ThreadPoolExecutor untuk fetch paralel
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_ticker = {
             executor.submit(fetch_stock_data, ticker): ticker
@@ -218,15 +217,12 @@ def run_full_screener(tickers, progress_container=None):
                 data = future.result()
                 if data:
                     results.append(data)
-            except Exception as e:
-                pass  # Lewati saham yang error
+            except Exception:
+                pass
 
-            # Update progress bar (jika ada)
-            if progress_container:
-                progress_container.progress(
-                    completed / total,
-                    text=f"[{completed}/{total}] Selesai: {ticker}"
-                )
+            # Update progress via callback
+            if progress_callback:
+                progress_callback(completed, total, ticker)
 
     df = pd.DataFrame(results)
     if df.empty:
@@ -270,10 +266,13 @@ if st.button("🚀 Jalankan Screener", type="primary"):
 
     progress_bar = st.progress(0, text="Memulai...")
 
-    df_results = run_full_screener(
-        tuple(tickers),  # tuple agar bisa di-cache
-        progress_container=progress_bar
-    )
+    def update_progress(completed, total, ticker):
+        progress_bar.progress(
+            completed / total,
+            text=f"[{completed}/{total}] Selesai: {ticker}"
+        )
+
+    df_results = run_full_screener(tickers, progress_callback=update_progress)
 
     progress_bar.empty()
 
