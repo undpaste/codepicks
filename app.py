@@ -444,7 +444,7 @@ if st.button("🚀 Jalankan Screener", type="primary"):
 
         display_df = df_results.head(top_n)[[
             'rank', 'ticker', 'name', 'sector', 'price', 'market_cap',
-            'rating', 'forward_pe', 'roe', 'return_12_1', 'return_6m',
+            'rating', 'forward_pe', 'pb', 'roe', 'return_12_1', 'return_6m',
             'value_score', 'quality_score', 'momentum_score_final',
             'sentiment_score_final', 'low_vol_score_final', 'extreme_move'
         ]].copy()
@@ -458,6 +458,7 @@ if st.button("🚀 Jalankan Screener", type="primary"):
         display_df['price'] = display_df['price'].apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "-")
         display_df['market_cap'] = display_df['market_cap'].apply(lambda x: f"${x/1e9:.1f}B" if pd.notna(x) else "-")
         display_df['forward_pe'] = display_df['forward_pe'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+        display_df['pb'] = display_df['pb'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
         display_df['roe'] = display_df['roe'].apply(lambda x: f"{x*100:.1f}%" if pd.notna(x) else "-")
         display_df['return_12_1'] = display_df['return_12_1'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "-")
         display_df['return_6m'] = display_df['return_6m'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "-")
@@ -466,7 +467,7 @@ if st.button("🚀 Jalankan Screener", type="primary"):
             display_df[col] = display_df[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
 
         display_df.columns = ['Rank', 'Ticker', 'Nama', 'Sektor', 'Harga', 'Mkt Cap',
-                              'Rating', 'Fwd P/E', 'ROE', 'Ret 12-1', 'Ret 6M',
+                              'Rating', 'Fwd P/E', 'PBV', 'ROE', 'Ret 12-1', 'Ret 6M',
                               'Value', 'Quality', 'Momentum', 'Sentiment', 'Low Vol']
 
         st.dataframe(display_df, use_container_width=True, hide_index=True)
