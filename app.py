@@ -35,7 +35,7 @@ MARKETS = {
     },
 }
 
-MAX_WORKERS = 2
+MAX_WORKERS = 4
 CACHE_TTL = 3600
 RETRY_ATTEMPTS = 3
 
@@ -147,182 +147,61 @@ def get_us_fallback():
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_idx_tickers():
-    return [
-        'BBCA','BBRI','BMRI','BBNI','BRIS','BTPS','ARTO','BBTN','BJBR','BJTM',
-        'BNGA','BNLI','PNBN','MEGA','NISP','BFIN','ADMF','PNLF','TUGU','ASBI',
-        'LPGI','MCOR','BABP','AGRO','BNII','BBHI','BCIC','AMAR','MFIN','WOMF',
-        'TLKM','EXCL','ISAT','TOWR','MTEL','TBIG','CENT',
-        'ASII','AUTO','SMSM','MAPI','ACES','ERAA','LPPF','RALS','SCCO',
-        'MAPA','CSAP','RANC','DIGI','FAST','RDTX','KIJA',
-        'UNVR','ICBP','INDF','MYOR','SIDO','AMRT','CPIN','JPFA','MAIN',
-        'HMSP','GGRM','WIIM','DMND','CAMP','ULTJ','STTP','TBLA','AISA','DLTA',
-        'MLBI','INDR','KEJU','CEKA','GOOD','PSDN','SKBM',
-        'ADRO','PTBA','ITMG','MEDC','PGAS','HRUM','AKRA','ELSA','BUMI','DOID',
-        'HRTA','TOBA','PTRO','KKGI','MYOH','DEWA','TGRA',
-        'ANTM','INCO','TINS','SMGR','INTP','BRPT','TPIA','INKP','TKIM','MDKA',
-        'NCKL','MBMA','NIKL','PSAB','IFSH','KRAS','ISSP','BAJA','JKSW','LION',
-        'GOTO','BUKA','EMTK','DMMX','MTDL','WIFI','AWAN','MLPT','TECH','LMAS',
-        'MIKA','SILO','HEAL','PRDA','KAEF','INAF','SAME','MTCN','DVLA','TSPC',
-        'PYFA','PEHA','SRAJ','RSGK','BIMA',
-        'UNTR','HEXA','PTPP','WIKA','ADHI','WSKT','JSMR','IPCM','TMAS','BULL',
-        'SOCI','ASSA','SMDR','HITS','PSSI','BLTA','MIRA','LEAD','IATA',
-        'MNCN','SCMA','FILM','BMTR','MSKY','IPTV','NETV',
-        'BSDE','CTRA','PWON','SMRA','ASRI','LPKR','DILD','DART','APLN',
-        'MTLA','BEST','RDTX','MKPI',
-        'TAPG','DSNG','SSMS','LSIP','AALI','SGRO','TBLA','CSRA','BWPT',
-        'INDS','SRIL','TRIS','ESTI','PBRX','POLY','UNIT','TRAM',
-        'MPMX','SDPC','IMAS','BRAM','GDYR','SSTM',
-    ]
-
-def sample_universe(all_tickers, size, use_full):
-    if use_full or size >= len(all_tickers):
-        return all_tickers
-    rng = random.Random(42)
-    return rng.sample(all_tickers, size)
-
-# ============================================================
-# HELPERS
-# ============================================================
-def calculate_altman_z(info, sector):
-    if sector in Z_SCORE_EXEMPT_SECTORS:
-        return np.nan
+    """Ambil SEMUA emiten IDX dengan 3 fallback berlapis."""
+    
+    # === Sumber 1: IDX Official API (paling lengkap) ===
     try:
-        wc = info.get('totalCurrentAssets', 0) - info.get('totalCurrentLiabilities', 0)
-        ta = info.get('totalAssets', 1) or 1
-        re = info.get('retainedEarnings', 0)
-        ebit = info.get('ebit', 0)
-        mcap = info.get('marketCap', 0)
-        tl = info.get('totalLiabilities', 1) or 1
-        sales = info.get('totalRevenue', 0)
-        if ta <= 0 or tl <= 0: return np.nan
-        return (1.2*(wc/ta) + 1.4*(re/ta) + 3.3*(ebit/ta) + 0.6*(mcap/tl) + 1.0*(sales/ta))
-    except Exception:
-        return np.nan
-
-def fetch_with_retry(fn, *args, attempts=RETRY_ATTEMPTS, **kwargs):
-    last_err = None
-    for i in range(attempts):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            last_err = e
-            time.sleep((1.5 ** i) + random.uniform(0, 0.4))
-    raise last_err
-
-# ============================================================
-# FETCH PER SAHAM (cached)
-# ============================================================
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_stock_data(ticker_base, market_suffix="", min_mcap=2_000_000_000, is_idx=False):
-    try:
-        time.sleep(random.uniform(0.15, 0.4))
-        full_ticker = f"{ticker_base}{market_suffix}" if market_suffix else ticker_base
-        stock = yf.Ticker(full_ticker)
-        info = fetch_with_retry(lambda: stock.info)
-        hist = fetch_with_retry(lambda: stock.history(period='2y'))
-
-        if hist.empty or len(hist) < 200:
-            return None
-
-        close = hist['Close']
-        current_price = close.iloc[-1]
-
-        # FIX: Market cap fallback (Yahoo sering return NaN untuk IDX)
-        market_cap = info.get('marketCap', np.nan)
-        if pd.isna(market_cap):
-            shares = info.get('sharesOutstanding', np.nan)
-            if pd.notna(shares) and pd.notna(current_price):
-                market_cap = shares * current_price
-
-        if pd.notna(market_cap) and market_cap < min_mcap:
-            return None
-
-        # FIX: Sector & Name fallback (khusus IDX)
-        sector = info.get('sector') or 'Unknown'
-        if sector in ('Unknown', '', None):
-            sector = IDX_SECTOR_FALLBACK.get(ticker_base, 'Other')
-
-        # FIX: Name fallback berlapis
-        name = info.get('longName') or info.get('shortName')
-        if not name or name == full_ticker:
-            name = IDX_NAME_MAP.get(ticker_base, ticker_base)
-
-        # Fundamental
-        forward_pe = info.get('forwardPE', np.nan)
-        trailing_pe = info.get('trailingPE', np.nan)
-        pb = info.get('priceToBook', np.nan)
-        ps = info.get('priceToSalesTrailing12Months', np.nan)
-        roe = info.get('returnOnEquity', np.nan)
-        roa = info.get('returnOnAssets', np.nan)
-        margin = info.get('operatingMargins', np.nan)
-
-        net_income = info.get('netIncomeToCommon', np.nan)
-        cfo = info.get('operatingCashflow', np.nan)
-        total_assets = info.get('totalAssets', np.nan)
-        accruals = (net_income - cfo) / total_assets if total_assets and total_assets > 0 else np.nan
-
-        altman_z = calculate_altman_z(info, sector)
-        debt_to_equity = info.get('debtToEquity', np.nan)
-        rev_growth = info.get('revenueGrowth', np.nan)
-
-        # FIX: Dividend yield fallback
-        div_yield = info.get('dividendYield', np.nan)
-        if pd.isna(div_yield):
-            div_yield = info.get('trailingAnnualDividendYield', np.nan)
-        if pd.notna(div_yield) and div_yield > 1:
-            div_yield = div_yield / 100
-
-        # Liquidity
-        avg_volume = info.get('averageVolume', np.nan)
-        avg_daily_value = (avg_volume * current_price) if pd.notna(avg_volume) and pd.notna(current_price) else np.nan
-
-        sma_200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
-        above_sma200 = bool(current_price > sma_200) if pd.notna(sma_200) else True
-
-        if len(close) >= 273:
-            return_12_1 = (close.iloc[-22] / close.iloc[-273] - 1) * 100
-        else:
-            return_12_1 = np.nan
-
-        if len(close) >= 126:
-            return_6m = (close.iloc[-1] / close.iloc[-126] - 1) * 100
-        else:
-            return_6m = np.nan
-
-        extreme_move = bool(
-            (pd.notna(return_12_1) and abs(return_12_1) > EXTREME_RETURN_12M_THRESHOLD) or
-            (pd.notna(return_6m) and abs(return_6m) > EXTREME_RETURN_6M_THRESHOLD)
-        )
-
-        daily_returns = close.pct_change().dropna()
-        volatility_1y = daily_returns.tail(252).std() * np.sqrt(252) * 100
-
-        target_mean = info.get('targetMeanPrice', np.nan)
-        analyst_upside = ((target_mean / current_price) - 1) * 100 if target_mean and current_price else np.nan
-        short_ratio = info.get('shortRatio', np.nan)
-        short_percent_float = info.get('shortPercentOfFloat', np.nan)
-
-        fundamental_fields = [forward_pe, pb, roe, roa, margin, rev_growth, div_yield]
-        data_completeness = sum(pd.notna(x) for x in fundamental_fields) / len(fundamental_fields) * 100
-
-        return {
-            'ticker': ticker_base, 'name': name, 'sector': sector,
-            'price': current_price, 'market_cap': market_cap,
-            'forward_pe': forward_pe, 'trailing_pe': trailing_pe,
-            'pb': pb, 'ps': ps, 'roe': roe, 'roa': roa, 'margin': margin,
-            'accruals': accruals, 'altman_z': altman_z,
-            'debt_to_equity': debt_to_equity,
-            'return_12_1': return_12_1, 'return_6m': return_6m,
-            'above_sma200': above_sma200, 'volatility': volatility_1y,
-            'analyst_upside': analyst_upside,
-            'short_ratio': short_ratio, 'short_percent_float': short_percent_float,
-            'rev_growth': rev_growth, 'div_yield': div_yield,
-            'avg_daily_value': avg_daily_value,
-            'data_completeness': data_completeness,
-            'extreme_move': extreme_move,
+        url = "https://www.idx.co.id/primary/StockData/GetSecuritiesStock"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.idx.co.id/en/market-data/stocks-data/stock-list/",
+            "Accept": "application/json, text/plain, */*",
         }
-    except Exception:
-        return None
+        params = {"start": 0, "length": 9999, "code": "", "sector": "", "board": "", "language": "en-us"}
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            rows = data.get("data", [])
+            tickers = []
+            seen = set()
+            for row in rows:
+                code = str(row.get("Code", "")).strip().upper()
+                if code and code.isalpha() and 3 <= len(code) <= 5 and code not in seen:
+                    tickers.append(code)
+                    seen.add(code)
+            if len(tickers) > 500:  # sanity check: harusnya ratusan
+                return sorted(tickers)
+    except Exception as e:
+        st.warning(f"IDX API gagal ({e}), coba Wikipedia...")
+
+    # === Sumber 2: Wikipedia Indonesia ===
+    try:
+        url = "https://id.wikipedia.org/wiki/Daftar_perusahaan_yang_tercatat_di_Bursa_Efek_Indonesia"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        tables = pd.read_html(StringIO(r.text))
+        tickers = []
+        seen = set()
+        for tbl in tables:
+            for col_name in tbl.columns:
+                if "Kode" in str(col_name) or "kode" in str(col_name):
+                    for raw in tbl[col_name].astype(str):
+                        # Format: "IDX: AALI" atau "AALI" atau "BEI: AALI"
+                        code = raw.split(":")[-1].strip().upper()
+                        code = code.replace("[", "").replace("]", "").strip()
+                        if code.isalpha() and 3 <= len(code) <= 5 and code not in seen:
+                            tickers.append(code)
+                            seen.add(code)
+                    break
+        if len(tickers) > 300:
+            return sorted(tickers)
+    except Exception as e:
+        st.warning(f"Wikipedia IDX gagal ({e}), pakai fallback list...")
+
+    # === Sumber 3: Fallback hardcoded (kurasi manual) ===
+    return get_idx_fallback_comprehensive()
 
 # ============================================================
 # SCORING
@@ -353,6 +232,11 @@ def calculate_scores(df, weights, is_idx=False):
     df['margin_score'] = sector_neutral_score(df, 'margin', ascending=False)
     df['accruals_score'] = sector_neutral_score(df, 'accruals', ascending=True)
     df['momentum_score'] = sector_neutral_score(df, 'return_12_1', ascending=False)
+        # FIX: Absolute momentum gate — kalau return < 0, cap momentum score max 60
+    # Biar saham yang "paling tidak jatuh di sektornya" gak dapat skor 100
+    df['momentum_score'] = sector_neutral_score(df, 'return_12_1', ascending=False)
+    df.loc[df['return_12_1'] < 0, 'momentum_score'] = df.loc[df['return_12_1'] < 0, 'momentum_score'].clip(upper=60)
+    df.loc[df['return_12_1'] < -20, 'momentum_score'] = df.loc[df['return_12_1'] < -20, 'momentum_score'].clip(upper=30)
     df['low_vol_score'] = sector_neutral_score(df, 'volatility', ascending=True)
     df['sentiment_score'] = sector_neutral_score(df, 'analyst_upside', ascending=False)
     df['short_score'] = sector_neutral_score(df, 'short_percent_float', ascending=True)
@@ -613,3 +497,94 @@ if st.button("🚀 Run Screener", type="primary"):
 
         csv = df_results.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download CSV", csv, "screener_results.csv", "text/csv")
+        def get_idx_fallback_comprehensive():
+    """Fallback: kurasi manual dari berbagai indeks IDX (~400 saham)."""
+    return [
+        # === FINANCIALS (~60) ===
+        'BBCA','BBRI','BMRI','BBNI','BRIS','BTPS','ARTO','BBTN','BJBR','BJTM',
+        'BNGA','BNLI','PNBN','MEGA','NISP','BFIN','ADMF','PNLF','TUGU','ASBI',
+        'LPGI','MCOR','BABP','AGRO','BNII','BBHI','BCIC','AMAR','MFIN','WOMF',
+        'BNBA','BBKP','BKSW','BMAS','BSIM','BTPN','BVIC','INPC','MAYA','MEGA',
+        'NOBU','PNBS','BBCA','BCAP','BHIT','BPFI','CFIN','HDFA','IMJS','JMAS',
+        'KREN','MFIN','PADI','PNIN','VRNA','WOMF','APIC','ASBI','BCIC','BBYB',
+        
+        # === BASIC MATERIALS (~60) ===
+        'ANTM','INCO','TINS','SMGR','INTP','BRPT','TPIA','INKP','TKIM','MDKA',
+        'NCKL','MBMA','NIKL','PSAB','IFSH','KRAS','ISSP','BAJA','JKSW','LION',
+        'ALKA','ALMI','ANJT','APLI','ARNA','BMSR','BRMS','BTON','CTBN','DPNS',
+        'EKAD','ESSA','GDST','GGRP','HKMU','IGAR','INAI','INDX','INTD','ITMA',
+        'JSPT','KBLI','KDSI','KIAS','LMSH','LION','LMPI','MARI','NIKL','PICO',
+        'POLY','PRAS','SMBR','SMKL','SPMA','SRIL','SSIA','SULI','TBMS','TIRT',
+        'TRST','YPAS','ZBRA',
+        
+        # === ENERGY (~40) ===
+        'ADRO','PTBA','ITMG','MEDC','PGAS','HRUM','AKRA','ELSA','BUMI','DOID',
+        'HRTA','TOBA','PTRO','KKGI','MYOH','DEWA','TGRA','AADI','APEX','ARTI',
+        'BIPI','BSSR','BYAN','CNKO','DWGL','ENRG','FIRE','GEMS','GTBO','HITS',
+        'INDY','ITMA','JATI','MBAP','PKPK','PSAB','PTBA','RMKE','SGER','SHIP',
+        'SMMT','SOCI','SUGI','TCPI','UNSP','WINS',
+        
+        # === CONSUMER DEFENSIVE (~50) ===
+        'UNVR','ICBP','INDF','MYOR','SIDO','AMRT','CPIN','JPFA','MAIN','HMSP',
+        'GGRM','WIIM','DMND','CAMP','ULTJ','STTP','TBLA','AISA','DLTA','MLBI',
+        'INDR','KEJU','CEKA','GOOD','PSDN','SKBM','ADES','BTEK','CINT','DLTA',
+        'FOOD','HOKI','IIKP','INDF','IPPE','MGNA','MRAT','PANI','PCAR','ROTI',
+        'SKLT','SMAR','TAST','TBLA','TRGU','ULTR','WAPO','AISA','ALTO','BUDI',
+        
+        # === CONSUMER CYCLICAL (~70) ===
+        'ASII','AUTO','SMSM','MAPI','ACES','ERAA','LPPF','RALS','SCCO','MAPA',
+        'CSAP','RANC','DIGI','FAST','RDTX','KIJA','AMFG','ARGO','ARTI','BCIP',
+        'BEBS','BLTA','BOGA','BRAM','BSSR','CNTX','DIGI','DIVA','DUCK','GDYR',
+        'HOTL','HRME','IMAS','INDR','INDS','JSPT','KKGI','LMPI','LPIN','MAMI',
+        'MDIA','MINA','MLBI','MNCN','MPMX','MSKY','MYTX','NIPS','PBRX','PDES',
+        'PMJS','POLY','PRAS','PSKT','PTSN','RAJA','RICY','RIGS','SSTM','STAR',
+        'TELE','TFCO','TIRT','TRIS','TRST','UNIT','VOKS','WAPO','YOII','ZONE',
+        
+        # === TELECOM & MEDIA (~15) ===
+        'TLKM','EXCL','ISAT','TOWR','MTEL','TBIG','CENT','MNCN','SCMA','FILM',
+        'BMTR','MSKY','IPTV','NETV','KBLV',
+        
+        # === TECHNOLOGY (~15) ===
+        'GOTO','BUKA','EMTK','DMMX','MTDL','WIFI','AWAN','MLPT','TECH','LMAS',
+        'ATIC','CYBR','DIGI','KETR','KREN','LUCK','NFCX','SIMS','TOSK','WGSH',
+        
+        # === HEALTHCARE (~30) ===
+        'MIKA','SILO','HEAL','PRDA','KAEF','INAF','SAME','MTCN','DVLA','TSPC',
+        'PYFA','PEHA','SRAJ','RSGK','BIMA','CARE','DGNS','INAF','IRRA','MERC',
+        'PEHA','PRIM','RSCH','SCPI','SOHO','SRAJ','SSIA','TSPC','DVLA','MEDC',
+        
+        # === INDUSTRIALS (~60) ===
+        'UNTR','HEXA','PTPP','WIKA','ADHI','WSKT','JSMR','IPCM','TMAS','BULL',
+        'SOCI','ASSA','SMDR','HITS','PSSI','BLTA','MIRA','LEAD','IATA','AMFG',
+        'APII','ARNA','BIMA','BULL','CANI','CITA','DPUM','GMFI','HEXA','HITS',
+        'IATA','ICON','INTA','JAST','JECC','JTPE','KARW','KIJA','KOBX','KOPI',
+        'LION','MARK','MDRN','MFMI','MIRA','MTLA','NELY','PADI','PJAA','PMJS',
+        'PPRE','PRIM','PSSI','PTIS','PTPP','RAJA','SCNP','SMBR','SMDR','SULI',
+        'TAMU','TIRA','TMAS','TPMA','TRIM','WEHA','WIKA','WSKT','ZBRA',
+        
+        # === REAL ESTATE & PROPERTY (~50) ===
+        'BSDE','CTRA','PWON','SMRA','ASRI','LPKR','DILD','DART','APLN','KIJA',
+        'MTLA','BEST','RDTX','MKPI','AGRS','APLN','ARMY','ASRI','BAPI','BCIP',
+        'BKDP','BKSL','BSSR','CITY','COWL','CPRI','CTRA','DART','DILD','DMAS',
+        'DUTI','ELTY','EMDE','FMII','GAMA','GMTD','GPRA','HOMI','IIKP','KARW',
+        'KOTA','LAND','LCGP','LPCK','LPKR','MDLN','MKPI','MTLA','MTSM','NIRO',
+        'NZIA','OMRE','PANI','PLIN','POLI','PUDP','RBMS','RDTX','REAL','RIGS',
+        'ROCK','RODA','SATU','SCBD','SMDM','SMRA','TARA','TOTL','TRAM','URBN',
+        
+        # === TRANSPORTATION & LOGISTICS (~25) ===
+        'ASSA','SMDR','TMAS','BULL','IPCM','PSSI','BLTA','LEAD','IATA','HITS',
+        'MIRA','SOCI','ELSA','RAJA','AKRA','HITS','CMPP','DEAL','GTRA','HUMI',
+        'IKAI','KARW','MDRN','NELY','SAFE','SHIP','SOCI','TAXI','WEHA',
+        
+        # === AGRICULTURE (~20) ===
+        'AALI','LSIP','SGRO','TAPG','DSNG','SSMS','TBLA','CSRA','BWPT','INDS',
+        'ANJT','DSNG','GZCO','MAGP','PALM','SIMP','SLIS','SMAR','SSMS','TBLA',
+        'TAPG','UNSP',
+        
+        # === OTHERS / HOLDING / MISC (~40) ===
+        'BHIT','BMTR','BNBR','BRNA','CNTX','DUTI','ELTY','FASW','GJTL','HMSP',
+        'INAI','INTP','JPFA','KBLI','KDSI','KIJA','LPPF','MAMI','MAPI','MIRA',
+        'MPMX','MYTX','NELY','PANI','PNIN','POOL','PSAB','PTRO','RAJA','RICY',
+        'RIGS','SSTM','STAR','TELE','TFCO','TIRT','TRAM','UNIT','VOKS','WAPO',
+    ]
+time.sleep(random.uniform(0.05, 0.15))
