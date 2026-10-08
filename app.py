@@ -1,21 +1,10 @@
 """
-Global Stock Screener Pro v4
-============================
-Perubahan utama vs v3 (cari tag  # [FIX]  / # [NEW]):
-
- [FIX-1] ARAH SKOR TERBALIK. rank(pct=True, ascending=True) memberi skor 100 ke nilai TERBESAR.
-         Di v3 semua faktor dipasang kebalikannya (PE mahal = skor value tinggi, ROE jelek = skor
-         quality tinggi, return terburuk = skor momentum tinggi). Sekarang pakai pct_score(higher_is_better).
- [FIX-2] Data kosong TIDAK lagi diisi 50 (netral). Skor dihitung dari komponen yang ada saja,
-         faktor yang datanya < 30% (mis. sentiment/short di IDX) otomatis dimatikan & bobotnya dibagi ulang.
- [FIX-3] Dividend yield dihitung dari dividendRate/harga (bebas masalah satuan persen vs pecahan).
- [FIX-4] Altman Z & accruals v3 memakai field yang umumnya tidak ada di yfinance .info
-         (totalAssets, retainedEarnings, ...) -> diganti cek kesehatan dari field yang memang ada.
- [FIX-5] Metrik negatif ditangani (PE/PB negatif tidak lagi dianggap murah).
- [FIX-6] Nama sektor fallback IDX disamakan dgn nama Yahoo ('Financials' -> 'Financial Services').
- [NEW]   Strategi "Neglected Value" + filter market cap RANGE (bukan cuma minimum) + likuiditas berbasis
-         ukuran posisi + filter 'sudah lari' + gate laba + faktor neglect (sedikit analis, kecil, institusi sedikit).
- [NEW]   Data di-fetch SEKALI lalu semua filter/slider dihitung ulang instan tanpa fetch ulang.
+Global Stock Screener Pro v4.1
+===============================
+Perubahan v4.1 vs v4:
+ [FIX-RATE] Fetch jadi 2-phase: batch download semua history (1 API call),
+            lalu fetch .info HANYA untuk kandidat yang lolos pre-filter likuiditas.
+            Dari ~900 request jadi ~50-80 request per screening → bebas rate limit.
 """
 import streamlit as st
 import yfinance as yf
@@ -44,8 +33,6 @@ STRATEGY_WEIGHTS = {
     NEGLECTED:                {'value': 0.40, 'quality': 0.25, 'momentum': 0.10, 'sentiment': 0.00, 'low_vol': 0.05, 'neglect': 0.20},
 }
 
-# Preset filter per strategi. mcap dalam satuan pasar (IDX: Rp triliun, US: $ miliar); mcap_max 0 = tanpa batas.
-# knife = (batas drawdown 6M %, toleransi di bawah SMA200 %, wajib di atas SMA200?)
 DEFAULT_PRESET = {
     'IDX': {'mcap_min': 1.0, 'mcap_max': 0.0, 'max_runup': 0.0, 'require_profit': False, 'knife': (-40, -20, True)},
     'US':  {'mcap_min': 2.0, 'mcap_max': 0.0, 'max_runup': 0.0, 'require_profit': False, 'knife': (-25, -10, True)},
@@ -76,7 +63,7 @@ MARKETS = {
         'code': 'IDX', 'suffix': '.JK', 'currency': 'Rp ',
         'mcap_mult': 1e12, 'mcap_unit': 'T',
         'pos_label': 'Target posisi per saham (Rp juta)', 'pos_mult': 1e6, 'pos_default': 50.0,
-        'adv_mult': 1e9, 'adv_unit': 'Rp B', 'fetch_min_adv': 1e8,   # lantai keras Rp100jt/hari buat buang saham "tidur"
+        'adv_mult': 1e9, 'adv_unit': 'Rp B', 'fetch_min_adv': 1e8,
         'universe_label': 'IDX', 'universe_max': 950, 'default_size': 300, 'default_full': True,
         'min_price': 100.0, 'max_pb': 10.0, 'max_vol': 120.0,
     },
@@ -86,10 +73,10 @@ MAX_WORKERS = 2
 CACHE_TTL = 6 * 3600
 RETRY_ATTEMPTS = 4
 MIN_LISTING_DAYS = 250
-MIN_SECTOR_SIZE = 8              # sector-neutral butuh >= 8 emiten, kalau kurang pakai ranking global
-MIN_FACTOR_COVERAGE = 0.30       # faktor dgn data < 30% emiten dimatikan
-MISSING_PENALTY = 35             # skor faktor yg kosong utk 1 saham (di bawah netral 50, bukan netral)
-PARTICIPATION = 0.10             # asumsi kita maksimal 10% dari volume harian saat masuk/keluar
+MIN_SECTOR_SIZE = 8
+MIN_FACTOR_COVERAGE = 0.30
+MISSING_PENALTY = 35
+PARTICIPATION = 0.10
 FINANCIAL_SECTORS = {'Financial Services'}
 LEVERAGE_EXEMPT = {'Financial Services', 'Real Estate', 'Utilities'}
 EXTREME_RETURN_12M_THRESHOLD = 200
@@ -169,7 +156,6 @@ IDX_SECTOR_FALLBACK = {
 }
 
 def get_idx_fallback_comprehensive():
-    """Fallback: kurasi manual dari berbagai indeks IDX."""
     raw = [
         'BBCA','BBRI','BMRI','BBNI','BRIS','BTPS','ARTO','BBTN','BJBR','BJTM',
         'BNGA','BNLI','PNBN','MEGA','NISP','BFIN','ADMF','PNLF','TUGU','ASBI',
@@ -226,7 +212,7 @@ def get_idx_fallback_comprehensive():
         'GZCO','MAGP','PALM','SIMP','SLIS',
         'BNBR','BRNA','FASW','GJTL','POOL',
     ]
-    return list(dict.fromkeys(raw))   # dedupe, urutan terjaga
+    return list(dict.fromkeys(raw))
 
 # ============================================================
 # UNIVERSE
@@ -259,7 +245,6 @@ def get_us_fallback():
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_idx_tickers():
-    """Ambil emiten IDX dengan 3 fallback berlapis."""
     try:
         url = "https://www.idx.co.id/primary/StockData/GetSecuritiesStock"
         headers = {
@@ -315,7 +300,6 @@ def sample_universe(all_tickers, size, use_full):
 # HELPERS
 # ============================================================
 def _num(x):
-    """Konversi aman ke float; None/str/inf -> NaN (yfinance kadang kasih 'Infinity')."""
     try:
         if x is None or isinstance(x, bool):
             return np.nan
@@ -351,41 +335,56 @@ def normalize_sector(sector, ticker_base):
     return SECTOR_ALIASES.get(sector, sector)
 
 # ============================================================
-# FETCH PER SAHAM (cached; TIDAK bergantung pada slider filter)
+# [FIX-RATE] FETCH: 2-PHASE BATCH
 # ============================================================
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_stock_data(ticker_base, market_suffix, fetch_min_adv):
-    """
-    Return (status, data). status: ok | no_data | short_history | illiquid | no_info | error
-    Urutan sengaja: history dulu (murah) -> cek umur & likuiditas -> baru .info (lambat).
-    """
+def fetch_batch_histories(tickers_tuple, suffix):
+    """Download SEMUA histories dalam 1 API call."""
+    full = [f"{t}{suffix}" for t in tickers_tuple]
     try:
-        time.sleep(random.uniform(0.2, 0.5))
-        full_ticker = f"{ticker_base}{market_suffix}"
-        stock = yf.Ticker(full_ticker)
+        return yf.download(full, period='2y', progress=False, auto_adjust=True,
+                          threads=True, group_by='ticker', timeout=60)
+    except Exception:
+        return None
 
-        hist = fetch_with_retry(lambda: stock.history(period='2y'))
-        if hist is None or hist.empty:
+def _process_batch_history(batch, ticker_base, suffix, fetch_min_adv):
+    """Ekstrak history dari batch. Return (status, payload)."""
+    full = f"{ticker_base}{suffix}"
+    try:
+        if batch is None or batch.empty:
             return ('no_data', None)
-        hist = hist.dropna(subset=['Close'])
-        if len(hist) < MIN_LISTING_DAYS:
+        if full not in batch.columns.get_level_values(0):
+            return ('no_data', None)
+        sub = batch[full].dropna(subset=['Close'])
+        if len(sub) < MIN_LISTING_DAYS:
             return ('short_history', None)
 
-        close = hist['Close']
-        volume = hist['Volume'].fillna(0)
+        close = sub['Close']
+        volume = sub['Volume'].fillna(0)
         price = float(close.iloc[-1])
+        if not np.isfinite(price) or price <= 0:
+            return ('no_data', None)
 
-        daily_value = (close * volume).tail(60)
-        adv_median = float(daily_value.median())            # median: kebal terhadap 1-2 hari spike gorengan
-        zero_vol_ratio = float((volume.tail(60) == 0).mean())  # porsi hari tanpa transaksi
+        adv_median = float((close * volume).tail(60).median())
+        zero_vol_ratio = float((volume.tail(60) == 0).mean())
         if not np.isfinite(adv_median) or adv_median < fetch_min_adv:
             return ('illiquid', None)
 
+        return ('ok', {'price': price, 'close': close, 'adv_median': adv_median,
+                       'zero_vol_ratio': zero_vol_ratio, 'hist_len': len(sub)})
+    except Exception:
+        return ('error', None)
+
+def _fetch_info_and_build(ticker_base, full_ticker, price, adv_median,
+                         zero_vol_ratio, close):
+    """Fetch .info dan bangun dict final. Dipanggil hanya untuk kandidat likuid."""
+    try:
+        time.sleep(random.uniform(0.2, 0.5))
+        stock = yf.Ticker(full_ticker)
         info = fetch_with_retry(lambda: stock.info) or {}
         if len(info) < 5:
             return ('no_info', None)
 
-        # --- Mata uang laporan vs mata uang harga (banyak emiten IDX lapor USD) ---
         ccy, fin_ccy = info.get('currency'), info.get('financialCurrency')
         fin_ok = not (ccy and fin_ccy and ccy != fin_ccy)
 
@@ -405,9 +404,7 @@ def fetch_stock_data(ticker_base, market_suffix, fetch_min_adv):
         profit_margin = _num(info.get('profitMargins'))
         rev_growth = _num(info.get('revenueGrowth'))
         debt_to_equity = _num(info.get('debtToEquity'))
-        current_ratio = _num(info.get('currentRatio'))
 
-        # Angka absolut dalam mata uang laporan -> hanya dipakai kalau sama dgn mata uang harga
         eps = _num(info.get('trailingEps')) if fin_ok else np.nan
         net_income = _num(info.get('netIncomeToCommon')) if fin_ok else np.nan
         ocf = _num(info.get('operatingCashflow')) if fin_ok else np.nan
@@ -423,16 +420,15 @@ def fetch_stock_data(ticker_base, market_suffix, fetch_min_adv):
         target_mean = _num(info.get('targetMeanPrice'))
         short_pct_float = _num(info.get('shortPercentOfFloat'))
 
-        # --- Turunan valuasi (semua: "lebih besar = lebih murah") ---
         if np.isfinite(trailing_pe) and trailing_pe > 0:
             earnings_yield = 1.0 / trailing_pe
         elif np.isfinite(eps):
-            earnings_yield = eps / price          # EPS negatif -> yield negatif (terburuk)
+            earnings_yield = eps / price
         else:
             earnings_yield = np.nan
 
         if np.isfinite(pb):
-            book_yield = (1.0 / pb) if pb > 0 else -1.0     # book negatif = terburuk, BUKAN murah
+            book_yield = (1.0 / pb) if pb > 0 else -1.0
         else:
             book_yield = np.nan
 
@@ -443,18 +439,16 @@ def fetch_stock_data(ticker_base, market_suffix, fetch_min_adv):
             ebitda_yield = np.nan
         sales_yield = (1.0 / ps) if (np.isfinite(ps) and ps > 0) else np.nan
 
-        # [FIX-3] dividend yield dari dividendRate / harga (tidak tergantung satuan field yield Yahoo)
         div_rate = _num(info.get('dividendRate'))
         if np.isnan(div_rate):
             div_rate = _num(info.get('trailingAnnualDividendRate'))
         if np.isfinite(div_rate) and div_rate > 0:
             div_yield = div_rate / price
-            if div_yield > 0.30:      # >30% hampir pasti data salah
+            if div_yield > 0.30:
                 div_yield = np.nan
         else:
             div_yield = 0.0
 
-        # [FIX-4] ganti accruals/Altman (field tidak tersedia) dgn metrik dari field yang ada
         accruals = ((net_income - ocf) / revenue) if (np.isfinite(net_income) and np.isfinite(ocf)
                                                        and np.isfinite(revenue) and revenue > 0) else np.nan
         net_debt_ebitda = np.nan
@@ -463,13 +457,12 @@ def fetch_stock_data(ticker_base, market_suffix, fetch_min_adv):
             if ebitda > 0:
                 net_debt_ebitda = (total_debt - total_cash) / ebitda
             elif total_debt > total_cash:
-                distress_flag = True   # EBITDA <= 0 dan utang bersih positif
+                distress_flag = True
 
         float_pct = np.nan
         if np.isfinite(float_sh) and np.isfinite(shares) and shares > 0:
             float_pct = min(100.0, float_sh / shares * 100)
 
-        # --- Harga & momentum ---
         sma_200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
         above_sma200 = bool(price > sma_200) if pd.notna(sma_200) else True
         lb = min(252, len(close) - 1)
@@ -516,13 +509,41 @@ def fetch_stock_data(ticker_base, market_suffix, fetch_min_adv):
         return ('error', None)
 
 def fetch_universe(tickers, suffix, fetch_min_adv, progress_callback=None):
+    """2-phase: batch history (1 call) -> selective .info untuk kandidat likuid."""
     results, failed = [], {}
     counts = Counter()
-    total, done = len(tickers), 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_stock_data, t, suffix, fetch_min_adv): t for t in tickers}
+    total = len(tickers)
+
+    if progress_callback:
+        progress_callback(0, total, "Phase 1: batch download history...")
+    batch = fetch_batch_histories(tuple(tickers), suffix)
+
+    candidates = []
+    for tb in tickers:
+        status, payload = _process_batch_history(batch, tb, suffix, fetch_min_adv)
+        counts[status] += 1
+        if status == 'ok':
+            candidates.append((tb, f"{tb}{suffix}", payload))
+        else:
+            failed.setdefault(status, []).append(tb)
+
+    n_candidates = len(candidates)
+    if n_candidates == 0:
+        return pd.DataFrame(results), dict(counts), failed
+
+    if progress_callback:
+        progress_callback(0, n_candidates, f"Phase 2: fetch info ({n_candidates} kandidat)...")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {}
+        for tb, full, payload in candidates:
+            futures[ex.submit(
+                _fetch_info_and_build, tb, full, payload['price'],
+                payload['adv_median'], payload['zero_vol_ratio'], payload['close']
+            )] = tb
+        done = 0
         for fut in as_completed(futures):
-            t = futures[fut]
+            tb = futures[fut]
             done += 1
             try:
                 status, data = fut.result()
@@ -532,22 +553,16 @@ def fetch_universe(tickers, suffix, fetch_min_adv, progress_callback=None):
             if status == 'ok' and data:
                 results.append(data)
             else:
-                failed.setdefault(status, []).append(t)
+                failed.setdefault(status, []).append(tb)
             if progress_callback:
-                progress_callback(done, total, t)
+                progress_callback(done, n_candidates, f"info: {tb}")
+
     return pd.DataFrame(results), dict(counts), failed
 
 # ============================================================
-# SCORING  ([FIX-1] arah skor yang benar)
+# SCORING
 # ============================================================
 def pct_score(df, col, higher_is_better=True):
-    """
-    Persentil 0-100, sector-neutral (fallback ke ranking global kalau sektor < MIN_SECTOR_SIZE).
-    higher_is_better=True  -> nilai TERBESAR dapat skor tertinggi (ROE, yield, return).
-    higher_is_better=False -> nilai TERKECIL dapat skor tertinggi (volatilitas, accruals, leverage).
-    NaN dibiarkan NaN (tidak diisi 50).
-    pandas: rank(ascending=True) memberi rank terkecil ke nilai terkecil -> skor tertinggi ke nilai terbesar.
-    """
     asc = bool(higher_is_better)
     s = df[col]
     global_r = s.rank(pct=True, ascending=asc) * 100
@@ -556,7 +571,6 @@ def pct_score(df, col, higher_is_better=True):
     return sector_r.where(sector_n >= MIN_SECTOR_SIZE, global_r)
 
 def weighted_available(score_df, weights, min_components=2):
-    """Rata-rata berbobot HANYA dari komponen yang ada. Kurang dari min_components -> NaN."""
     cols = list(weights.keys())
     w = pd.Series(weights, dtype=float)
     vals = score_df[cols]
@@ -569,11 +583,9 @@ def weighted_available(score_df, weights, min_components=2):
 def calculate_scores(df, weights):
     df = df.copy()
     fin = df['sector'].isin(FINANCIAL_SECTORS)
-    # Metrik yang tidak bermakna untuk bank/asuransi -> kosongkan (BUKAN diisi netral)
     for c in ['fcf_yield', 'ebitda_yield', 'sales_yield', 'net_debt_ebitda', 'accruals', 'debt_to_equity']:
         df.loc[fin, c] = np.nan
 
-    # ---------- VALUE ----------
     val_scores = pd.DataFrame({
         'ey': pct_score(df, 'earnings_yield', True),
         'by': pct_score(df, 'book_yield', True),
@@ -584,51 +596,45 @@ def calculate_scores(df, weights):
     })
     value = weighted_available(val_scores, {'ey': .30, 'by': .25, 'fy': .20, 'eb': .10, 'sy': .05, 'dy': .10}, 2)
 
-    # ---------- QUALITY ----------
     qual_scores = pd.DataFrame({
         'roe': pct_score(df, 'roe', True),
         'roa': pct_score(df, 'roa', True),
         'mar': pct_score(df, 'margin', True),
-        'acc': pct_score(df, 'accruals', False),          # accruals kecil = bagus
-        'de':  pct_score(df, 'debt_to_equity', False),    # utang kecil = bagus
+        'acc': pct_score(df, 'accruals', False),
+        'de':  pct_score(df, 'debt_to_equity', False),
         'gr':  pct_score(df.assign(rev_growth=df['rev_growth'].clip(-0.5, 1.0)), 'rev_growth', True),
     })
     quality = weighted_available(qual_scores, {'roe': .25, 'roa': .15, 'mar': .25, 'acc': .15, 'de': .10, 'gr': .10}, 3)
 
-    # ---------- NEGLECT (sedikit diliput = potensi harga belum efisien) ----------
-    an = df['analysts_n'].fillna(0)        # kosong = tidak ada analis -> justru informatif
+    an = df['analysts_n'].fillna(0)
     an_score = pd.Series(np.select([an == 0, an <= 2, an <= 5], [100, 70, 40], default=10), index=df.index)
     neg_scores = pd.DataFrame({
         'an': an_score,
-        'sz': pct_score(df, 'market_cap', False),         # makin kecil makin "terlupakan"
-        'in': pct_score(df, 'inst_pct', False),           # institusi sedikit
+        'sz': pct_score(df, 'market_cap', False),
+        'in': pct_score(df, 'inst_pct', False),
     })
     neglect = weighted_available(neg_scores, {'an': .5, 'sz': .3, 'in': .2}, 1)
 
-    # ---------- MOMENTUM ----------
     r12, r6 = df['return_12_1'], df['return_6m']
     mom = pct_score(df, 'return_12_1', True)
     mom = mom.where(~(r12 < 0), mom.clip(upper=60))
     mom = mom.where(~(r12 < -20), mom.clip(upper=30))
-    mom = mom.where(~((r12 > 100) & (r6 < -20)), mom * 0.3)     # pump & dump
-    mom = mom.where(~((r6 > 150) & (df['volatility'] > 80)), mom * 0.5)   # gorengan klasik
+    mom = mom.where(~((r12 > 100) & (r6 < -20)), mom * 0.3)
+    mom = mom.where(~((r6 > 150) & (df['volatility'] > 80)), mom * 0.5)
     rsi_s = df['rsi'].apply(lambda x: max(0.0, 100 - abs(x - 55) * 2) if pd.notna(x) else np.nan)
     momentum = (mom * 0.7 + rsi_s * 0.3).where(rsi_s.notna(), mom)
 
-    # ---------- SENTIMENT ----------
     sent_scores = pd.DataFrame({
         'up': pct_score(df, 'analyst_upside', True),
-        'sh': pct_score(df, 'short_pct_float', False),     # short interest kecil = bagus
+        'sh': pct_score(df, 'short_pct_float', False),
     })
     sentiment = weighted_available(sent_scores, {'up': .7, 'sh': .3}, 1)
 
-    # ---------- LOW VOL ----------
     low_vol = pct_score(df, 'volatility', False)
 
     factor_scores = {'value': value, 'quality': quality, 'momentum': momentum,
                      'sentiment': sentiment, 'low_vol': low_vol, 'neglect': neglect}
 
-    # [FIX-2] bobot efektif: faktor dgn data < 30% emiten dimatikan, sisanya dinormalisasi ulang
     eff_w = {}
     for k, sc in factor_scores.items():
         coverage = float(sc.notna().mean()) if len(sc) else 0.0
@@ -649,7 +655,7 @@ def calculate_scores(df, weights):
     return df, eff_w
 
 # ============================================================
-# FILTER + SKOR (murni pandas -> dihitung ulang instan saat slider diubah)
+# FILTER
 # ============================================================
 def _step(df, funnel, label, cond):
     before = len(df)
@@ -712,7 +718,6 @@ def screen(raw_df, p, strategy, weights):
 
     df, eff_w = calculate_scores(df, weights)
 
-    # Flag peringatan
     def _flags(r):
         f = []
         if r['extreme_move']: f.append("⚠️ret-ekstrem")
@@ -736,9 +741,9 @@ def fmt_pct(x, mult=1.0, nd=1):
 
 def main():
     st.set_page_config(page_title="Global Stock Screener Pro", layout="wide")
-    st.title("📊 Global Stock Screener Pro v4")
+    st.title("📊 Global Stock Screener Pro v4.1")
     st.caption(f"⚡ {MAX_WORKERS} threads | 💾 Cache {CACHE_TTL//3600} jam | 🌏 US + Indonesia | "
-               f"Fetch sekali, filter & skor dihitung ulang instan")
+               f"Batch fetch (1 call untuk semua history) + selective info")
 
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -747,7 +752,8 @@ def main():
         code = cfg['code']
         is_idx = code == 'IDX'
 
-        strategy = st.selectbox("Strategy:", list(STRATEGY_WEIGHTS.keys()), index=len(STRATEGY_WEIGHTS) - 1 if is_idx else 0)
+        strategy = st.selectbox("Strategy:", list(STRATEGY_WEIGHTS.keys()),
+                                index=len(STRATEGY_WEIGHTS) - 1 if is_idx else 0)
         weights = STRATEGY_WEIGHTS[strategy]
         preset = get_preset(strategy, code)
 
@@ -758,7 +764,7 @@ def main():
 
         st.divider()
         st.subheader("🎛️ Filter (instan, tanpa fetch ulang)")
-        k = f"{code}|{strategy}"   # key per market+strategi -> default ikut preset saat strategi diganti
+        k = f"{code}|{strategy}"
         unit = cfg['mcap_unit']
         c1, c2 = st.columns(2)
         mcap_min = c1.number_input(f"Mcap min ({cfg['currency'].strip()}{unit})", min_value=0.0,
@@ -767,36 +773,39 @@ def main():
                                    value=float(preset['mcap_max']), step=0.5, key=f"mmax|{k}")
         min_price = st.number_input(f"Harga minimum ({cfg['currency'].strip()})", min_value=0.0,
                                     value=float(cfg['min_price']), step=10.0 if is_idx else 1.0, key=f"mp|{k}")
-        pos_value_u = st.number_input(cfg['pos_label'], min_value=1.0, value=float(cfg['pos_default']), step=10.0, key=f"pos|{code}")
+        pos_value_u = st.number_input(cfg['pos_label'], min_value=1.0,
+                                      value=float(cfg['pos_default']), step=10.0, key=f"pos|{code}")
         max_exit_days = st.slider("Maks. hari untuk masuk/keluar posisi", 1, 10, 3, key=f"exit|{code}",
-                                  help=f"Asumsi kamu maksimal {int(PARTICIPATION*100)}% dari volume harian. "
-                                       f"Saham yang butuh lebih lama dari ini dianggap tidak likuid untuk ukuran posisimu.")
+                                  help=f"Asumsi kamu maksimal {int(PARTICIPATION*100)}% dari volume harian.")
         max_zero_vol = st.slider("Maks. hari tanpa transaksi (60 hari, %)", 0, 100, 25, key=f"zv|{code}")
         min_completeness = st.slider("Min. kelengkapan data fundamental (%)", 0, 100, 50, key=f"mc|{code}")
-        max_pb = st.number_input("PBV maksimum", min_value=0.5, value=float(cfg['max_pb']), step=0.5, key=f"pb|{code}")
-        max_vol = st.number_input("Volatilitas tahunan maks (%)", min_value=20.0, value=float(cfg['max_vol']), step=10.0, key=f"vol|{code}")
-        min_float = st.slider("Min. free float (%) — hanya jika datanya ada", 0, 50, 10 if is_idx else 0, key=f"fl|{code}")
+        max_pb = st.number_input("PBV maksimum", min_value=0.5, value=float(cfg['max_pb']),
+                                 step=0.5, key=f"pb|{code}")
+        max_vol = st.number_input("Volatilitas tahunan maks (%)", min_value=20.0,
+                                  value=float(cfg['max_vol']), step=10.0, key=f"vol|{code}")
+        min_float = st.slider("Min. free float (%)", 0, 50, 10 if is_idx else 0, key=f"fl|{code}")
         max_runup = st.number_input("Maks. kenaikan 12 bulan (%) (0=off)", min_value=0.0,
-                                    value=float(preset['max_runup']), step=10.0, key=f"ru|{k}",
-                                    help="Buang saham yang sudah 'lari' — kalau tujuanmu beli sebelum re-rating.")
-        require_profit = st.checkbox("Wajib laba & arus kas operasi positif", value=preset['require_profit'], key=f"rp|{k}")
+                                    value=float(preset['max_runup']), step=10.0, key=f"ru|{k}")
+        require_profit = st.checkbox("Wajib laba & arus kas operasi positif",
+                                     value=preset['require_profit'], key=f"rp|{k}")
 
         st.divider()
-        st.caption("**Bobot strategi:** " + " | ".join(f"{n[:3].title()} {w*100:.0f}%" for n, w in weights.items() if w > 0))
+        st.caption("**Bobot strategi:** " + " | ".join(f"{n[:3].title()} {w*100:.0f}%"
+                                                       for n, w in weights.items() if w > 0))
         if st.button("🗑️ Clear Cache"):
             st.cache_data.clear()
             st.session_state.pop('raw', None)
             st.success("Cache cleared.")
             st.rerun()
 
-    # ---------------- FETCH ----------------
     if st.button("🚀 Fetch data & Run", type="primary"):
         all_tickers = get_sp500_tickers() if code == 'US' else get_idx_tickers()
         tickers = sample_universe(all_tickers, size, use_full)
         st.info(f"Fetch **{len(tickers)}** dari {len(all_tickers)} ticker {cfg['universe_label']} "
-                f"(pertama kali bisa lama; hasil di-cache {CACHE_TTL//3600} jam).")
+                f"(batch mode, hasil di-cache {CACHE_TTL//3600} jam).")
         bar = st.progress(0, text="Mulai...")
-        def cb(c, t, tk): bar.progress(c / t, text=f"[{c}/{t}] {tk}")
+        def cb(c, t, tk):
+            bar.progress(min(c / max(t, 1), 1.0), text=f"[{c}/{t}] {tk}")
         raw_df, counts, failed = fetch_universe(tickers, cfg['suffix'], cfg['fetch_min_adv'], cb)
         bar.empty()
         st.session_state['raw'] = {'code': code, 'df': raw_df, 'counts': counts, 'failed': failed,
@@ -811,7 +820,6 @@ def main():
         st.error(f"Tidak ada data. Status fetch: {raw['counts']}. Coba lagi beberapa menit (kemungkinan rate limit Yahoo).")
         return
 
-    # ---------------- FILTER + SKOR ----------------
     pos_value = pos_value_u * cfg['pos_mult']
     params = {
         'mcap_min': mcap_min * cfg['mcap_mult'], 'mcap_max': mcap_max * cfg['mcap_mult'],
@@ -827,12 +835,12 @@ def main():
     st.success(f"✅ **{len(df)} saham** lolos semua filter (dari {len(raw_df)} yang datanya berhasil di-fetch).")
     with st.expander("ℹ️ Funnel: kenapa jumlahnya segini"):
         st.write(f"- Diminta: {raw['n_requested']} ticker | Data berhasil: {len(raw_df)}")
-        st.write(f"- Status fetch: {raw['counts']}  (illiquid = ADV di bawah lantai keras fetch; short_history = listing < {MIN_LISTING_DAYS} hari)")
+        st.write(f"- Status fetch: {raw['counts']}")
         for label, n in funnel:
             st.write(f"- {label}: **-{n}**")
         st.write(f"- **Lolos: {len(df)}**")
         if eff_w:
-            st.write("- Bobot efektif (faktor yang datanya < 30% otomatis dimatikan): " +
+            st.write("- Bobot efektif: " +
                      ", ".join(f"{k} {v*100:.0f}%" for k, v in eff_w.items() if v > 0))
     if raw['failed']:
         with st.expander("⚠️ Ticker yang gagal / dibuang saat fetch"):
@@ -840,10 +848,9 @@ def main():
                 st.write(f"**{status}** ({len(lst)}): " + ", ".join(lst[:80]) + (" ..." if len(lst) > 80 else ""))
 
     if df.empty:
-        st.warning("Tidak ada saham yang lolos. Longgarkan filter di sidebar (mis. mcap max, anti-sudah-lari, wajib laba).")
+        st.warning("Tidak ada saham yang lolos. Longgarkan filter di sidebar.")
         return
 
-    # ---------------- TABEL ----------------
     st.subheader(f"🏆 Top {top_n} — {strategy}")
     cur, mdiv, mu = cfg['currency'], cfg['mcap_mult'], cfg['mcap_unit']
     t = df.head(top_n)
@@ -867,9 +874,8 @@ def main():
         'Flag': t['flag'],
     })
     st.dataframe(out, use_container_width=True, hide_index=True)
-    st.caption("Skor 0-100 = persentil dalam sektor (100 = terbaik di faktor itu). 'Hari Exit' = estimasi hari untuk "
-               "masuk/keluar posisi targetmu pada partisipasi 10% volume. Flag ⚠️/💧/🔸/🚀 = hal yang perlu dicek manual. "
-               "Ini daftar KANDIDAT untuk diteliti lebih lanjut (laporan keuangan, kepemilikan, free float, berita), bukan sinyal beli.")
+    st.caption("Skor 0-100 = persentil dalam sektor. Flag ⚠️/💧/🔸/🚀 = hal yang perlu dicek manual. "
+               "Ini daftar KANDIDAT, bukan sinyal beli.")
 
     st.subheader("🏭 Sector Distribution")
     st.bar_chart(t['sector'].value_counts())
