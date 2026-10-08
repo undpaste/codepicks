@@ -34,9 +34,9 @@ MARKETS = {
     },
 }
 
-MAX_WORKERS = 4
+MAX_WORKERS = 2
 CACHE_TTL = 3600
-RETRY_ATTEMPTS = 3
+RETRY_ATTEMPTS = 4
 
 Z_SCORE_EXEMPT_SECTORS = {'Financial Services', 'Real Estate', 'Financials'}
 EXTREME_RETURN_12M_THRESHOLD = 200
@@ -270,10 +270,12 @@ def get_idx_tickers():
     return get_idx_fallback_comprehensive()
 
 def sample_universe(all_tickers, size, use_full):
-    if use_full or size >= len(all_tickers):
-        return all_tickers
-    rng = random.Random(42)
-    return rng.sample(all_tickers, size)
+    # FIX: shuffle dulu biar kalau rate limit kena, gak bias ke alphabet awal
+    shuffled = all_tickers.copy()
+    random.Random(42).shuffle(shuffled)
+    if use_full or size >= len(shuffled):
+        return shuffled
+    return shuffled[:size]
 
 # ============================================================
 # HELPERS
@@ -310,7 +312,7 @@ def fetch_with_retry(fn, *args, attempts=RETRY_ATTEMPTS, **kwargs):
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_stock_data(ticker_base, market_suffix="", min_mcap=2_000_000_000, is_idx=False):
     try:
-        time.sleep(random.uniform(0.05, 0.15))
+        time.sleep(random.uniform(0.3, 0.7))   # Naik dari 0.05-0.15
         full_ticker = f"{ticker_base}{market_suffix}" if market_suffix else ticker_base
         stock = yf.Ticker(full_ticker)
         info = fetch_with_retry(lambda: stock.info)
