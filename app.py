@@ -22,13 +22,23 @@ STRATEGY_WEIGHTS = {
 
 MARKETS = {
     "🇺🇸 US Market (S&P 500)": {
-        "suffix": "", "min_mcap": 2_000_000_000,
+        "suffix": "",
+        "min_mcap": 2_000_000_000,       # $2B
+        "min_price": 5,                  # $5
+        "min_daily_value": 5_000_000,    # $5M
+        "max_pb": 20,
+        "max_volatility": 150,
         "currency": "$", "mcap_divisor": 1e9, "mcap_unit": "B",
         "universe_label": "S&P 500", "universe_max": 500, "default_size": 100,
     },
     "🇮🇩 Indonesia (IDX)": {
         "suffix": ".JK",
-        "min_mcap": 100_000_000_000,
+        # REVISI: threshold dinaikkan biar gorengan gak lolos
+        "min_mcap": 1_000_000_000_000,   # Rp 1T (dari Rp 100B)
+        "min_price": 500,                # Rp 500 (anti-penny)
+        "min_daily_value": 10_000_000_000,  # Rp 10B (dari Rp 1B)
+        "max_pb": 10,                    # PBV max 10x
+        "max_volatility": 100,           # Volatilitas tahunan max 100%
         "currency": "Rp ", "mcap_divisor": 1e12, "mcap_unit": "T",
         "universe_label": "IDX Likuid", "universe_max": 950, "default_size": 100,
     },
@@ -37,11 +47,12 @@ MARKETS = {
 MAX_WORKERS = 2
 CACHE_TTL = 3600
 RETRY_ATTEMPTS = 4
+MIN_LISTING_DAYS = 250              # REVISI: minimal 1 tahun listing
+MIN_SECTOR_SIZE = 5                 # REVISI: sector-neutral butuh minimal 5 emiten
 
 Z_SCORE_EXEMPT_SECTORS = {'Financial Services', 'Real Estate', 'Financials'}
 EXTREME_RETURN_12M_THRESHOLD = 200
 EXTREME_RETURN_6M_THRESHOLD = 150
-IDX_MIN_DAILY_VALUE = 1_000_000_000
 
 IDX_NAME_MAP = {
     'BBCA':'Bank Central Asia Tbk','BBRI':'Bank Rakyat Indonesia Tbk',
@@ -115,19 +126,17 @@ IDX_SECTOR_FALLBACK = {
 }
 
 # ============================================================
-# FUNGSI FALLBACK (DIPINDAH KE ATAS — FIX BUG 1)
+# FUNGSI FALLBACK
 # ============================================================
 def get_idx_fallback_comprehensive():
     """Fallback: kurasi manual dari berbagai indeks IDX (~400 saham unik)."""
     return [
-        # FINANCIALS
         'BBCA','BBRI','BMRI','BBNI','BRIS','BTPS','ARTO','BBTN','BJBR','BJTM',
         'BNGA','BNLI','PNBN','MEGA','NISP','BFIN','ADMF','PNLF','TUGU','ASBI',
         'LPGI','MCOR','BABP','AGRO','BNII','BBHI','BCIC','AMAR','MFIN','WOMF',
         'BNBA','BBKP','BKSW','BMAS','BSIM','BTPN','BVIC','INPC','MAYA',
         'NOBU','PNBS','BCAP','BHIT','BPFI','CFIN','HDFA','IMJS','JMAS',
         'KREN','PADI','PNIN','VRNA','APIC','BBYB',
-        # BASIC MATERIALS
         'ANTM','INCO','TINS','SMGR','INTP','BRPT','TPIA','INKP','TKIM','MDKA',
         'NCKL','MBMA','NIKL','PSAB','IFSH','KRAS','ISSP','BAJA','JKSW','LION',
         'ALKA','ALMI','ANJT','APLI','ARNA','BMSR','BRMS','BTON','CTBN','DPNS',
@@ -135,19 +144,16 @@ def get_idx_fallback_comprehensive():
         'JSPT','KBLI','KDSI','KIAS','LMSH','LMPI','MARI','PICO',
         'POLY','PRAS','SMBR','SMKL','SPMA','SRIL','SSIA','SULI','TBMS','TIRT',
         'TRST','YPAS','ZBRA',
-        # ENERGY
         'ADRO','PTBA','ITMG','MEDC','PGAS','HRUM','AKRA','ELSA','BUMI','DOID',
         'HRTA','TOBA','PTRO','KKGI','MYOH','DEWA','TGRA','AADI','APEX','ARTI',
         'BIPI','BSSR','BYAN','CNKO','DWGL','ENRG','FIRE','GEMS','GTBO','HITS',
         'INDY','JATI','MBAP','PKPK','RMKE','SGER','SHIP',
         'SMMT','SOCI','SUGI','TCPI','UNSP','WINS',
-        # CONSUMER DEFENSIVE
         'UNVR','ICBP','INDF','MYOR','SIDO','AMRT','CPIN','JPFA','MAIN','HMSP',
         'GGRM','WIIM','DMND','CAMP','ULTJ','STTP','TBLA','AISA','DLTA','MLBI',
         'INDR','KEJU','CEKA','GOOD','PSDN','SKBM','ADES','BTEK','CINT',
         'FOOD','HOKI','IIKP','IPPE','MGNA','MRAT','PANI','PCAR','ROTI',
         'SKLT','SMAR','TAST','TRGU','ULTR','WAPO','ALTO','BUDI',
-        # CONSUMER CYCLICAL
         'ASII','AUTO','SMSM','MAPI','ACES','ERAA','LPPF','RALS','SCCO','MAPA',
         'CSAP','RANC','DIGI','FAST','RDTX','KIJA','AMFG','ARGO','BCIP',
         'BEBS','BLTA','BOGA','BRAM','CNTX','DIVA','DUCK','GDYR',
@@ -155,24 +161,19 @@ def get_idx_fallback_comprehensive():
         'MDIA','MINA','MPMX','MSKY','MYTX','NIPS','PBRX','PDES',
         'PMJS','PSKT','PTSN','RAJA','RICY','RIGS','SSTM','STAR',
         'TELE','TFCO','TRIS','UNIT','VOKS','YOII','ZONE',
-        # TELECOM & MEDIA
         'TLKM','EXCL','ISAT','TOWR','MTEL','TBIG','CENT','MNCN','SCMA','FILM',
         'BMTR','IPTV','NETV','KBLV',
-        # TECHNOLOGY
         'GOTO','BUKA','EMTK','DMMX','MTDL','WIFI','AWAN','MLPT','TECH','LMAS',
         'ATIC','CYBR','KETR','LUCK','NFCX','SIMS','TOSK','WGSH',
-        # HEALTHCARE
         'MIKA','SILO','HEAL','PRDA','KAEF','INAF','SAME','MTCN','DVLA','TSPC',
         'PYFA','PEHA','SRAJ','RSGK','BIMA','CARE','DGNS','IRRA','MERC',
         'PRIM','RSCH','SCPI','SOHO',
-        # INDUSTRIALS
         'UNTR','HEXA','PTPP','WIKA','ADHI','WSKT','JSMR','IPCM','TMAS','BULL',
         'SOCI','ASSA','SMDR','PSSI','LEAD','IATA',
         'APII','CANI','CITA','DPUM','GMFI',
         'ICON','INTA','JAST','JECC','JTPE','KARW','KOBX','KOPI',
         'MARK','MDRN','MFMI','MTLA','NELY','PJAA','PPRE',
         'PTIS','SCNP','TAMU','TIRA','TPMA','TRIM','WEHA',
-        # REAL ESTATE
         'BSDE','CTRA','PWON','SMRA','ASRI','LPKR','DILD','DART','APLN',
         'BEST','MKPI','AGRS','ARMY','BAPI',
         'BKDP','BKSL','CITY','COWL','CPRI','DMAS',
@@ -180,12 +181,9 @@ def get_idx_fallback_comprehensive():
         'KOTA','LAND','LCGP','LPCK','MDLN','MTSM','NIRO',
         'NZIA','OMRE','PLIN','POLI','PUDP','RBMS','REAL',
         'ROCK','RODA','SATU','SCBD','SMDM','TARA','TOTL','TRAM','URBN',
-        # TRANSPORTATION
         'CMPP','DEAL','GTRA','HUMI','IKAI','SAFE','TAXI',
-        # AGRICULTURE
         'AALI','LSIP','SGRO','TAPG','DSNG','SSMS','CSRA','BWPT',
         'GZCO','MAGP','PALM','SIMP','SLIS',
-        # OTHERS
         'BNBR','BRNA','FASW','GJTL','POOL',
     ]
 
@@ -221,7 +219,6 @@ def get_us_fallback():
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_idx_tickers():
     """Ambil emiten IDX dengan 3 fallback berlapis."""
-    # Sumber 1: IDX Official API
     try:
         url = "https://www.idx.co.id/primary/StockData/GetSecuritiesStock"
         headers = {
@@ -244,7 +241,6 @@ def get_idx_tickers():
     except Exception:
         pass
 
-    # Sumber 2: Wikipedia IDX
     try:
         url = "https://id.wikipedia.org/wiki/Daftar_perusahaan_yang_tercatat_di_Bursa_Efek_Indonesia"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -266,11 +262,9 @@ def get_idx_tickers():
     except Exception:
         pass
 
-    # Sumber 3: Fallback hardcoded
     return get_idx_fallback_comprehensive()
 
 def sample_universe(all_tickers, size, use_full):
-    # FIX: shuffle dulu biar kalau rate limit kena, gak bias ke alphabet awal
     shuffled = all_tickers.copy()
     random.Random(42).shuffle(shuffled)
     if use_full or size >= len(shuffled):
@@ -306,19 +300,32 @@ def fetch_with_retry(fn, *args, attempts=RETRY_ATTEMPTS, **kwargs):
             time.sleep((1.5 ** i) + random.uniform(0, 0.4))
     raise last_err
 
+def calculate_rsi(close, period=14):
+    """REVISI: RSI sebagai konfirmasi momentum."""
+    try:
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1] if not rsi.empty else np.nan
+    except Exception:
+        return np.nan
+
 # ============================================================
 # FETCH PER SAHAM
 # ============================================================
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_stock_data(ticker_base, market_suffix="", min_mcap=2_000_000_000, is_idx=False):
     try:
-        time.sleep(random.uniform(0.3, 0.7))   # Naik dari 0.05-0.15
+        time.sleep(random.uniform(0.3, 0.7))
         full_ticker = f"{ticker_base}{market_suffix}" if market_suffix else ticker_base
         stock = yf.Ticker(full_ticker)
         info = fetch_with_retry(lambda: stock.info)
         hist = fetch_with_retry(lambda: stock.history(period='2y'))
 
-        if hist.empty or len(hist) < 200:
+        # REVISI: minimal listing age
+        if hist.empty or len(hist) < MIN_LISTING_DAYS:
             return None
 
         close = hist['Close']
@@ -331,6 +338,11 @@ def fetch_stock_data(ticker_base, market_suffix="", min_mcap=2_000_000_000, is_i
                 market_cap = shares * current_price
 
         if pd.notna(market_cap) and market_cap < min_mcap:
+            return None
+
+        # REVISI: filter harga minimum (anti-penny stock)
+        min_price = 500 if is_idx else 5
+        if pd.notna(current_price) and current_price < min_price:
             return None
 
         sector = info.get('sector') or 'Unknown'
@@ -373,6 +385,9 @@ def fetch_stock_data(ticker_base, market_suffix="", min_mcap=2_000_000_000, is_i
         return_12_1 = (close.iloc[-22] / close.iloc[-273] - 1) * 100 if len(close) >= 273 else np.nan
         return_6m = (close.iloc[-1] / close.iloc[-126] - 1) * 100 if len(close) >= 126 else np.nan
 
+        # REVISI: RSI untuk konfirmasi momentum
+        rsi = calculate_rsi(close)
+
         extreme_move = bool(
             (pd.notna(return_12_1) and abs(return_12_1) > EXTREME_RETURN_12M_THRESHOLD) or
             (pd.notna(return_6m) and abs(return_6m) > EXTREME_RETURN_6M_THRESHOLD)
@@ -398,6 +413,7 @@ def fetch_stock_data(ticker_base, market_suffix="", min_mcap=2_000_000_000, is_i
             'debt_to_equity': debt_to_equity,
             'return_12_1': return_12_1, 'return_6m': return_6m,
             'above_sma200': above_sma200, 'volatility': volatility_1y,
+            'rsi': rsi,
             'analyst_upside': analyst_upside,
             'short_ratio': short_ratio, 'short_percent_float': short_percent_float,
             'rev_growth': rev_growth, 'div_yield': div_yield,
@@ -415,7 +431,15 @@ def winsorize(series, lower=0.01, upper=0.99):
     return series.clip(series.quantile(lower), series.quantile(upper))
 
 def sector_neutral_score(df, column, ascending=True):
-    return df.groupby('sector')[column].rank(pct=True, ascending=ascending) * 100
+    """
+    REVISI: sector-neutral ranking, tapi fallback ke global ranking
+    kalau sektor < MIN_SECTOR_SIZE emiten. Cegah FUTR jadi #1 di sektor
+    yang cuma 3 emiten.
+    """
+    sector_sizes = df.groupby('sector')[column].transform('count')
+    sector_score = df.groupby('sector')[column].rank(pct=True, ascending=ascending) * 100
+    global_score = df[column].rank(pct=True, ascending=ascending) * 100
+    return sector_score.where(sector_sizes >= MIN_SECTOR_SIZE, global_score)
 
 def calculate_scores(df, weights, is_idx=False):
     df = df.copy()
@@ -441,14 +465,30 @@ def calculate_scores(df, weights, is_idx=False):
     df['short_score'] = sector_neutral_score(df, 'short_percent_float', ascending=True)
     df['div_score'] = sector_neutral_score(df, 'div_yield', ascending=False)
 
-    # Momentum score + absolute gate (FIX: hapus duplikasi)
+    # Momentum score + absolute gate
     df['momentum_score'] = sector_neutral_score(df, 'return_12_1', ascending=False)
     df.loc[df['return_12_1'] < 0, 'momentum_score'] = df.loc[df['return_12_1'] < 0, 'momentum_score'].clip(upper=60)
     df.loc[df['return_12_1'] < -20, 'momentum_score'] = df.loc[df['return_12_1'] < -20, 'momentum_score'].clip(upper=30)
 
+    # REVISI: Pump & dump detector
+    pump_dump_mask = (df['return_12_1'] > 100) & (df['return_6m'] < -20)
+    df.loc[pump_dump_mask, 'momentum_score'] = df.loc[pump_dump_mask, 'momentum_score'] * 0.3
+
+    # REVISI: Gorengan classic = return 6M > 150% + volatilitas > 80%
+    gorengan_mask = (df['return_6m'] > 150) & (df['volatility'] > 80)
+    df.loc[gorengan_mask, 'momentum_score'] = df.loc[gorengan_mask, 'momentum_score'] * 0.5
+
+    # REVISI: RSI score (ideal 45-65, di luar itu kurang baik)
+    if 'rsi' in df.columns:
+        df['rsi_score'] = df['rsi'].apply(
+            lambda x: max(0, 100 - abs(x - 55) * 2) if pd.notna(x) else 50
+        )
+    else:
+        df['rsi_score'] = 50
+
     score_cols = ['fpe_score','pb_score','ps_score','roe_score','roa_score','margin_score',
                   'accruals_score','momentum_score','low_vol_score','sentiment_score',
-                  'short_score','div_score']
+                  'short_score','div_score','rsi_score']
 
     for col in score_cols:
         df[col] = df[col].fillna(50)
@@ -464,7 +504,10 @@ def calculate_scores(df, weights, is_idx=False):
 
     df['quality_score'] = (df['roe_score']*0.3 + df['roa_score']*0.2 +
                            df['margin_score']*0.3 + df['accruals_score']*0.2)
-    df['momentum_score_final'] = df['momentum_score']
+
+    # REVISI: momentum final = momentum + RSI confirmation
+    df['momentum_score_final'] = df['momentum_score'] * 0.7 + df['rsi_score'] * 0.3
+
     df['sentiment_score_final'] = df['sentiment_score']*0.7 + df['short_score']*0.3
     df['low_vol_score_final'] = df['low_vol_score']
 
@@ -482,7 +525,8 @@ def calculate_scores(df, weights, is_idx=False):
 # PIPELINE
 # ============================================================
 def run_full_screener(tickers, weights, strategy_name, market_suffix="",
-                      min_mcap=2_000_000_000, is_idx=False, progress_callback=None):
+                      min_mcap=2_000_000_000, is_idx=False, progress_callback=None,
+                      max_pb=20, max_volatility=150, min_daily_value=5_000_000):
     results = []
     failed_tickers = []
     total = len(tickers)
@@ -514,10 +558,19 @@ def run_full_screener(tickers, weights, strategy_name, market_suffix="",
 
     n_before = len(df)
 
-    if is_idx:
-        df = df[(df['avg_daily_value'].isna()) | (df['avg_daily_value'] >= IDX_MIN_DAILY_VALUE)].reset_index(drop=True)
-        if df.empty:
-            return df, n_failed, n_before, 0, failed_tickers
+    # REVISI: Gabungan filter likuiditas + anti-gorengan
+    df = df[
+        (df['avg_daily_value'].isna()) | (df['avg_daily_value'] >= min_daily_value)
+    ].reset_index(drop=True)
+
+    # REVISI: PBV filter (anti-gorengan PBV ekstrem)
+    df = df[(df['pb'].isna()) | (df['pb'] <= max_pb)].reset_index(drop=True)
+
+    # REVISI: Volatilitas filter (anti-gorengan volatile)
+    df = df[(df['volatility'].isna()) | (df['volatility'] <= max_volatility)].reset_index(drop=True)
+
+    if df.empty:
+        return df, n_failed, n_before, 0, failed_tickers
 
     df = df[
         (df['altman_z'].isna() | (df['altman_z'] >= 1.8)) &
@@ -562,7 +615,7 @@ def run_full_screener(tickers, weights, strategy_name, market_suffix="",
 # ============================================================
 st.set_page_config(page_title="Global Stock Screener Pro", layout="wide")
 st.title("📊 Global Stock Screener Pro")
-st.caption(f"⚡ {MAX_WORKERS} threads | 💾 Cache {CACHE_TTL//60} min | 🌏 US + Indonesia")
+st.caption(f"⚡ {MAX_WORKERS} threads | 💾 Cache {CACHE_TTL//60} min | 🌏 US + Indonesia | 🛡️ Anti-gorengan filters ON")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -585,6 +638,10 @@ with st.sidebar:
                f"M {weights['momentum']*100:.0f}% | S {weights['sentiment']*100:.0f}% | "
                f"LV {weights['low_vol']*100:.0f}%")
 
+    if is_idx:
+        st.caption(f"🛡️ **Filter Aktif IDX:** Mkt Cap ≥ Rp 1T | Harga ≥ Rp 500 | "
+                   f"Daily Value ≥ Rp 10B | PBV ≤ 10 | Volatilitas ≤ 100%")
+
     st.divider()
     if st.button("🗑️ Clear Cache"):
         st.cache_data.clear()
@@ -606,7 +663,10 @@ if st.button("🚀 Run Screener", type="primary"):
         market_suffix=market_cfg["suffix"],
         min_mcap=market_cfg["min_mcap"],
         is_idx=is_idx,
-        progress_callback=update_progress
+        progress_callback=update_progress,
+        max_pb=market_cfg["max_pb"],
+        max_volatility=market_cfg["max_volatility"],
+        min_daily_value=market_cfg["min_daily_value"],
     )
     progress_bar.empty()
 
@@ -617,8 +677,8 @@ if st.button("🚀 Run Screener", type="primary"):
 
         with st.expander("ℹ️ Funnel detail"):
             st.write(f"- Diminta: {len(tickers)} ticker")
-            st.write(f"- Gagal fetch: {n_failed}")
-            st.write(f"- Tersaring kesehatan + likuiditas: {n_pre}")
+            st.write(f"- Gagal fetch (rate limit / data kosong / mcap kecil / penny / listing < 1yr): {n_failed}")
+            st.write(f"- Tersaring likuiditas + PBV + volatilitas + kesehatan: {n_pre}")
             st.write(f"- Tersaring Falling Knife Guard: {n_knife}")
             st.write(f"- **Lolos: {len(df_results)}**")
 
