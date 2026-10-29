@@ -1,10 +1,13 @@
 """
-Global Stock Screener Pro v4.1
+Global Stock Screener Pro v5.0
 ===============================
-Perubahan v4.1 vs v4:
- [FIX-RATE] Fetch jadi 2-phase: batch download semua history (1 API call),
-            lalu fetch .info HANYA untuk kandidat yang lolos pre-filter likuiditas.
-            Dari ~900 request jadi ~50-80 request per screening → bebas rate limit.
+Changelog v5.0 (Codepicks integration):
+ [NEW] Tab UI: Stock Screener | Crypto | Macro AI | Portfolio | AI Fund
+ [NEW] AI Macro Analysis (OpenAI gpt-4o-mini) — regime, risks, allocation
+ [NEW] Crypto Screener (30 top coins, live-cached 60s, refresh button)
+ [NEW] Portfolio Builder + Sharpe/Sortino/Calmar/MaxDD + max-Sharpe optimizer
+ [NEW] AI Fund (paper trading, auto-rebalance dari Top-N screener, benchmark)
+ [IMPROVED] Custom CSS, metric cards, expander, status indicators
 """
 import streamlit as st
 import yfinance as yf
@@ -19,8 +22,29 @@ from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
 
+# ---------- Optional deps (graceful fallback) ----------
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+try:
+    from scipy.optimize import minimize
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+
 # ============================================================
-# KONFIGURASI
+# KONFIGURASI (existing)
 # ============================================================
 NEGLECTED = "🔎 Neglected Value (small-cap inefisien)"
 DEEP_VALUE = "💰 Deep Value"
@@ -58,6 +82,7 @@ MARKETS = {
         'adv_mult': 1e6, 'adv_unit': '$M', 'fetch_min_adv': 1e6,
         'universe_label': 'S&P 500', 'universe_max': 500, 'default_size': 100, 'default_full': False,
         'min_price': 5.0, 'max_pb': 20.0, 'max_vol': 150.0,
+        'benchmark': '^GSPC',
     },
     "🇮🇩 Indonesia (IDX)": {
         'code': 'IDX', 'suffix': '.JK', 'currency': 'Rp ',
@@ -66,6 +91,7 @@ MARKETS = {
         'adv_mult': 1e9, 'adv_unit': 'Rp B', 'fetch_min_adv': 1e8,
         'universe_label': 'IDX', 'universe_max': 950, 'default_size': 300, 'default_full': True,
         'min_price': 100.0, 'max_pb': 10.0, 'max_vol': 120.0,
+        'benchmark': '^JKSE',
     },
 }
 
@@ -81,7 +107,6 @@ FINANCIAL_SECTORS = {'Financial Services'}
 LEVERAGE_EXEMPT = {'Financial Services', 'Real Estate', 'Utilities'}
 EXTREME_RETURN_12M_THRESHOLD = 200
 EXTREME_RETURN_6M_THRESHOLD = 150
-
 SECTOR_ALIASES = {'Financials': 'Financial Services'}
 
 IDX_NAME_MAP = {
@@ -156,66 +181,21 @@ IDX_SECTOR_FALLBACK = {
 }
 
 def get_idx_fallback_comprehensive():
-    raw = [
-        'BBCA','BBRI','BMRI','BBNI','BRIS','BTPS','ARTO','BBTN','BJBR','BJTM',
-        'BNGA','BNLI','PNBN','MEGA','NISP','BFIN','ADMF','PNLF','TUGU','ASBI',
-        'LPGI','MCOR','BABP','AGRO','BNII','BBHI','BCIC','AMAR','MFIN','WOMF',
-        'BNBA','BBKP','BKSW','BMAS','BSIM','BTPN','BVIC','INPC','MAYA',
-        'NOBU','PNBS','BCAP','BHIT','BPFI','CFIN','HDFA','IMJS','JMAS',
-        'KREN','PADI','PNIN','VRNA','APIC','BBYB','BDMN',
-        'ANTM','INCO','TINS','SMGR','INTP','BRPT','TPIA','INKP','TKIM','MDKA',
-        'NCKL','MBMA','NIKL','PSAB','IFSH','KRAS','ISSP','BAJA','JKSW','LION',
-        'ALKA','ALMI','ANJT','APLI','ARNA','BMSR','BRMS','BTON','CTBN','DPNS',
-        'EKAD','ESSA','GDST','GGRP','HKMU','IGAR','INAI','INDX','INTD','ITMA',
-        'JSPT','KBLI','KDSI','KIAS','LMSH','LMPI','MARI','PICO',
-        'POLY','PRAS','SMBR','SMKL','SPMA','SRIL','SSIA','SULI','TBMS','TIRT',
-        'TRST','YPAS','ZBRA',
-        'ADRO','PTBA','ITMG','MEDC','PGAS','HRUM','AKRA','ELSA','BUMI','DOID',
-        'HRTA','TOBA','PTRO','KKGI','MYOH','DEWA','TGRA','AADI','APEX','ARTI',
-        'BIPI','BSSR','BYAN','CNKO','DWGL','ENRG','FIRE','GEMS','GTBO','HITS',
-        'INDY','JATI','MBAP','PKPK','RMKE','SGER','SHIP',
-        'SMMT','SOCI','SUGI','TCPI','UNSP','WINS',
-        'UNVR','ICBP','INDF','MYOR','SIDO','AMRT','CPIN','JPFA','MAIN','HMSP',
-        'GGRM','WIIM','DMND','CAMP','ULTJ','STTP','TBLA','AISA','DLTA','MLBI',
-        'INDR','KEJU','CEKA','GOOD','PSDN','SKBM','ADES','BTEK','CINT',
-        'FOOD','HOKI','IIKP','IPPE','MGNA','MRAT','PANI','PCAR','ROTI',
-        'SKLT','SMAR','TAST','TRGU','ULTR','WAPO','ALTO','BUDI',
-        'ASII','AUTO','SMSM','MAPI','ACES','ERAA','LPPF','RALS','SCCO','MAPA',
-        'CSAP','RANC','DIGI','FAST','RDTX','KIJA','AMFG','ARGO','BCIP',
-        'BEBS','BLTA','BOGA','BRAM','CNTX','DIVA','DUCK','GDYR',
-        'HOTL','HRME','IMAS','INDS','LPIN','MAMI',
-        'MDIA','MINA','MPMX','MSKY','MYTX','NIPS','PBRX','PDES',
-        'PMJS','PSKT','PTSN','RAJA','RICY','RIGS','SSTM','STAR',
-        'TELE','TFCO','TRIS','UNIT','VOKS','YOII','ZONE',
-        'TLKM','EXCL','ISAT','TOWR','MTEL','TBIG','CENT','MNCN','SCMA','FILM',
-        'BMTR','IPTV','NETV','KBLV',
-        'GOTO','BUKA','EMTK','DMMX','MTDL','WIFI','AWAN','MLPT','TECH','LMAS',
-        'ATIC','CYBR','KETR','LUCK','NFCX','SIMS','TOSK','WGSH',
-        'MIKA','SILO','HEAL','PRDA','KAEF','INAF','SAME','MTCN','DVLA','TSPC',
-        'PYFA','PEHA','SRAJ','RSGK','BIMA','CARE','DGNS','IRRA','MERC',
-        'PRIM','RSCH','SCPI','SOHO',
-        'UNTR','HEXA','PTPP','WIKA','ADHI','WSKT','JSMR','IPCM','TMAS','BULL',
-        'ASSA','SMDR','PSSI','LEAD','IATA','HATM',
-        'APII','CANI','CITA','DPUM','GMFI',
-        'ICON','INTA','JAST','JECC','JTPE','KARW','KOBX','KOPI',
-        'MARK','MDRN','MFMI','MTLA','NELY','PJAA','PPRE',
-        'PTIS','SCNP','TAMU','TIRA','TPMA','TRIM','WEHA',
-        'BSDE','CTRA','PWON','SMRA','ASRI','LPKR','DILD','DART','APLN',
-        'BEST','MKPI','AGRS','ARMY','BAPI',
-        'BKDP','BKSL','CITY','COWL','CPRI','DMAS',
-        'DUTI','ELTY','EMDE','FMII','GAMA','GMTD','GPRA','HOMI',
-        'KOTA','LAND','LCGP','LPCK','MDLN','MTSM','NIRO',
-        'NZIA','OMRE','PLIN','POLI','PUDP','RBMS','REAL',
-        'ROCK','RODA','SATU','SCBD','SMDM','TARA','TOTL','TRAM','URBN',
-        'CMPP','DEAL','GTRA','HUMI','IKAI','SAFE','TAXI',
-        'AALI','LSIP','SGRO','TAPG','DSNG','SSMS','CSRA','BWPT',
-        'GZCO','MAGP','PALM','SIMP','SLIS',
-        'BNBR','BRNA','FASW','GJTL','POOL',
-    ]
+    raw = ['BBCA','BBRI','BMRI','BBNI','BRIS','BTPS','ARTO','BBTN','BJBR','BJTM',
+           'BNGA','BNLI','PNBN','MEGA','NISP','BFIN','ADMF','PNLF','TUGU','ASBI',
+           'LPGI','MCOR','BABP','AGRO','ANTM','INCO','TINS','SMGR','INTP','BRPT',
+           'TPIA','INKP','TKIM','MDKA','NCKL','MBMA','ADRO','PTBA','ITMG','MEDC',
+           'PGAS','HRUM','AKRA','ELSA','BUMI','DOID','UNVR','ICBP','INDF','MYOR',
+           'SIDO','AMRT','CPIN','JPFA','MAIN','HMSP','GGRM','ASII','AUTO','SMSM',
+           'MAPI','ACES','ERAA','TLKM','EXCL','ISAT','TOWR','MTEL','MNCN','SCMA',
+           'GOTO','BUKA','EMTK','MIKA','SILO','HEAL','PRDA','KAEF','INAF','PTPP',
+           'WIKA','ADHI','WSKT','JSMR','BSDE','CTRA','PWON','SMRA','ASRI','LPKR',
+           'UNTR','HEXA']
     return list(dict.fromkeys(raw))
 
+
 # ============================================================
-# UNIVERSE
+# UNIVERSE (existing)
 # ============================================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_sp500_tickers():
@@ -265,10 +245,9 @@ def get_idx_tickers():
                 return sorted(tickers)
     except Exception:
         pass
-
     try:
         url = "https://id.wikipedia.org/wiki/Daftar_perusahaan_yang_tercatat_di_Bursa_Efek_Indonesia"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
         tables = pd.read_html(StringIO(r.text))
@@ -277,8 +256,7 @@ def get_idx_tickers():
             for col_name in tbl.columns:
                 if "Kode" in str(col_name) or "kode" in str(col_name):
                     for raw in tbl[col_name].astype(str):
-                        code = raw.split(":")[-1].strip().upper()
-                        code = code.replace("[", "").replace("]", "").strip()
+                        code = raw.split(":")[-1].strip().upper().replace("[", "").replace("]", "").strip()
                         if code.isalpha() and 3 <= len(code) <= 5 and code not in seen:
                             tickers.append(code); seen.add(code)
                     break
@@ -286,7 +264,6 @@ def get_idx_tickers():
             return sorted(tickers)
     except Exception:
         pass
-
     return get_idx_fallback_comprehensive()
 
 def sample_universe(all_tickers, size, use_full):
@@ -296,8 +273,9 @@ def sample_universe(all_tickers, size, use_full):
         return shuffled
     return shuffled[:size]
 
+
 # ============================================================
-# HELPERS
+# HELPERS (existing)
 # ============================================================
 def _num(x):
     try:
@@ -334,12 +312,12 @@ def normalize_sector(sector, ticker_base):
         sector = IDX_SECTOR_FALLBACK.get(ticker_base, 'Other')
     return SECTOR_ALIASES.get(sector, sector)
 
+
 # ============================================================
-# [FIX-RATE] FETCH: 2-PHASE BATCH
+# FETCH (existing) — 2-phase batch
 # ============================================================
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_batch_histories(tickers_tuple, suffix):
-    """Download SEMUA histories dalam 1 API call."""
     full = [f"{t}{suffix}" for t in tickers_tuple]
     try:
         return yf.download(full, period='2y', progress=False, auto_adjust=True,
@@ -348,7 +326,6 @@ def fetch_batch_histories(tickers_tuple, suffix):
         return None
 
 def _process_batch_history(batch, ticker_base, suffix, fetch_min_adv):
-    """Ekstrak history dari batch. Return (status, payload)."""
     full = f"{ticker_base}{suffix}"
     try:
         if batch is None or batch.empty:
@@ -358,18 +335,15 @@ def _process_batch_history(batch, ticker_base, suffix, fetch_min_adv):
         sub = batch[full].dropna(subset=['Close'])
         if len(sub) < MIN_LISTING_DAYS:
             return ('short_history', None)
-
         close = sub['Close']
         volume = sub['Volume'].fillna(0)
         price = float(close.iloc[-1])
         if not np.isfinite(price) or price <= 0:
             return ('no_data', None)
-
         adv_median = float((close * volume).tail(60).median())
         zero_vol_ratio = float((volume.tail(60) == 0).mean())
         if not np.isfinite(adv_median) or adv_median < fetch_min_adv:
             return ('illiquid', None)
-
         return ('ok', {'price': price, 'close': close, 'adv_median': adv_median,
                        'zero_vol_ratio': zero_vol_ratio, 'hist_len': len(sub)})
     except Exception:
@@ -377,22 +351,18 @@ def _process_batch_history(batch, ticker_base, suffix, fetch_min_adv):
 
 def _fetch_info_and_build(ticker_base, full_ticker, price, adv_median,
                          zero_vol_ratio, close):
-    """Fetch .info dan bangun dict final. Dipanggil hanya untuk kandidat likuid."""
     try:
         time.sleep(random.uniform(0.2, 0.5))
         stock = yf.Ticker(full_ticker)
         info = fetch_with_retry(lambda: stock.info) or {}
         if len(info) < 5:
             return ('no_info', None)
-
         ccy, fin_ccy = info.get('currency'), info.get('financialCurrency')
         fin_ok = not (ccy and fin_ccy and ccy != fin_ccy)
-
         market_cap = _num(info.get('marketCap'))
         shares = _num(info.get('sharesOutstanding'))
         if np.isnan(market_cap) and np.isfinite(shares):
             market_cap = shares * price
-
         trailing_pe = _num(info.get('trailingPE'))
         forward_pe = _num(info.get('forwardPE'))
         pb = _num(info.get('priceToBook'))
@@ -404,7 +374,6 @@ def _fetch_info_and_build(ticker_base, full_ticker, price, adv_median,
         profit_margin = _num(info.get('profitMargins'))
         rev_growth = _num(info.get('revenueGrowth'))
         debt_to_equity = _num(info.get('debtToEquity'))
-
         eps = _num(info.get('trailingEps')) if fin_ok else np.nan
         net_income = _num(info.get('netIncomeToCommon')) if fin_ok else np.nan
         ocf = _num(info.get('operatingCashflow')) if fin_ok else np.nan
@@ -413,32 +382,24 @@ def _fetch_info_and_build(ticker_base, full_ticker, price, adv_median,
         total_debt = _num(info.get('totalDebt')) if fin_ok else np.nan
         total_cash = _num(info.get('totalCash')) if fin_ok else np.nan
         ebitda = _num(info.get('ebitda')) if fin_ok else np.nan
-
         analysts_n = _num(info.get('numberOfAnalystOpinions'))
         inst_pct = _num(info.get('heldPercentInstitutions'))
         float_sh = _num(info.get('floatShares'))
         target_mean = _num(info.get('targetMeanPrice'))
         short_pct_float = _num(info.get('shortPercentOfFloat'))
-
         if np.isfinite(trailing_pe) and trailing_pe > 0:
             earnings_yield = 1.0 / trailing_pe
         elif np.isfinite(eps):
             earnings_yield = eps / price
         else:
             earnings_yield = np.nan
-
         if np.isfinite(pb):
             book_yield = (1.0 / pb) if pb > 0 else -1.0
         else:
             book_yield = np.nan
-
         fcf_yield = (fcf / market_cap) if (np.isfinite(fcf) and np.isfinite(market_cap) and market_cap > 0) else np.nan
-        if np.isfinite(ev_ebitda):
-            ebitda_yield = (1.0 / ev_ebitda) if ev_ebitda > 0 else -1.0
-        else:
-            ebitda_yield = np.nan
+        ebitda_yield = (1.0 / ev_ebitda) if (np.isfinite(ev_ebitda) and ev_ebitda > 0) else (np.nan if not np.isfinite(ev_ebitda) else -1.0)
         sales_yield = (1.0 / ps) if (np.isfinite(ps) and ps > 0) else np.nan
-
         div_rate = _num(info.get('dividendRate'))
         if np.isnan(div_rate):
             div_rate = _num(info.get('trailingAnnualDividendRate'))
@@ -448,7 +409,6 @@ def _fetch_info_and_build(ticker_base, full_ticker, price, adv_median,
                 div_yield = np.nan
         else:
             div_yield = 0.0
-
         accruals = ((net_income - ocf) / revenue) if (np.isfinite(net_income) and np.isfinite(ocf)
                                                        and np.isfinite(revenue) and revenue > 0) else np.nan
         net_debt_ebitda = np.nan
@@ -458,11 +418,9 @@ def _fetch_info_and_build(ticker_base, full_ticker, price, adv_median,
                 net_debt_ebitda = (total_debt - total_cash) / ebitda
             elif total_debt > total_cash:
                 distress_flag = True
-
         float_pct = np.nan
         if np.isfinite(float_sh) and np.isfinite(shares) and shares > 0:
             float_pct = min(100.0, float_sh / shares * 100)
-
         sma_200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
         above_sma200 = bool(price > sma_200) if pd.notna(sma_200) else True
         lb = min(252, len(close) - 1)
@@ -471,22 +429,17 @@ def _fetch_info_and_build(ticker_base, full_ticker, price, adv_median,
         return_6m = (close.iloc[-1] / close.iloc[-126] - 1) * 100 if len(close) >= 126 else np.nan
         rsi = calculate_rsi(close)
         volatility = close.pct_change().dropna().tail(252).std() * np.sqrt(252) * 100
-
         extreme_move = bool(
             (pd.notna(return_12_1) and abs(return_12_1) > EXTREME_RETURN_12M_THRESHOLD) or
             (pd.notna(return_6m) and abs(return_6m) > EXTREME_RETURN_6M_THRESHOLD)
         )
-
         analyst_upside = ((target_mean / price) - 1) * 100 if np.isfinite(target_mean) else np.nan
-
         core = [earnings_yield, book_yield, roe, roa, margin, rev_growth, debt_to_equity, ocf]
         data_completeness = sum(pd.notna(x) for x in core) / len(core) * 100
-
         sector = normalize_sector(info.get('sector'), ticker_base)
         name = info.get('longName') or info.get('shortName')
         if not name or name == full_ticker:
             name = IDX_NAME_MAP.get(ticker_base, ticker_base)
-
         return ('ok', {
             'ticker': ticker_base, 'name': name, 'sector': sector,
             'price': price, 'market_cap': market_cap,
@@ -509,15 +462,12 @@ def _fetch_info_and_build(ticker_base, full_ticker, price, adv_median,
         return ('error', None)
 
 def fetch_universe(tickers, suffix, fetch_min_adv, progress_callback=None):
-    """2-phase: batch history (1 call) -> selective .info untuk kandidat likuid."""
     results, failed = [], {}
     counts = Counter()
     total = len(tickers)
-
     if progress_callback:
         progress_callback(0, total, "Phase 1: batch download history...")
     batch = fetch_batch_histories(tuple(tickers), suffix)
-
     candidates = []
     for tb in tickers:
         status, payload = _process_batch_history(batch, tb, suffix, fetch_min_adv)
@@ -526,14 +476,11 @@ def fetch_universe(tickers, suffix, fetch_min_adv, progress_callback=None):
             candidates.append((tb, f"{tb}{suffix}", payload))
         else:
             failed.setdefault(status, []).append(tb)
-
     n_candidates = len(candidates)
     if n_candidates == 0:
         return pd.DataFrame(results), dict(counts), failed
-
     if progress_callback:
         progress_callback(0, n_candidates, f"Phase 2: fetch info ({n_candidates} kandidat)...")
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {}
         for tb, full, payload in candidates:
@@ -556,11 +503,11 @@ def fetch_universe(tickers, suffix, fetch_min_adv, progress_callback=None):
                 failed.setdefault(status, []).append(tb)
             if progress_callback:
                 progress_callback(done, n_candidates, f"info: {tb}")
-
     return pd.DataFrame(results), dict(counts), failed
 
+
 # ============================================================
-# SCORING
+# SCORING (existing)
 # ============================================================
 def pct_score(df, col, higher_is_better=True):
     asc = bool(higher_is_better)
@@ -585,7 +532,6 @@ def calculate_scores(df, weights):
     fin = df['sector'].isin(FINANCIAL_SECTORS)
     for c in ['fcf_yield', 'ebitda_yield', 'sales_yield', 'net_debt_ebitda', 'accruals', 'debt_to_equity']:
         df.loc[fin, c] = np.nan
-
     val_scores = pd.DataFrame({
         'ey': pct_score(df, 'earnings_yield', True),
         'by': pct_score(df, 'book_yield', True),
@@ -595,7 +541,6 @@ def calculate_scores(df, weights):
         'dy': pct_score(df, 'div_yield', True),
     })
     value = weighted_available(val_scores, {'ey': .30, 'by': .25, 'fy': .20, 'eb': .10, 'sy': .05, 'dy': .10}, 2)
-
     qual_scores = pd.DataFrame({
         'roe': pct_score(df, 'roe', True),
         'roa': pct_score(df, 'roa', True),
@@ -605,7 +550,6 @@ def calculate_scores(df, weights):
         'gr':  pct_score(df.assign(rev_growth=df['rev_growth'].clip(-0.5, 1.0)), 'rev_growth', True),
     })
     quality = weighted_available(qual_scores, {'roe': .25, 'roa': .15, 'mar': .25, 'acc': .15, 'de': .10, 'gr': .10}, 3)
-
     an = df['analysts_n'].fillna(0)
     an_score = pd.Series(np.select([an == 0, an <= 2, an <= 5], [100, 70, 40], default=10), index=df.index)
     neg_scores = pd.DataFrame({
@@ -614,7 +558,6 @@ def calculate_scores(df, weights):
         'in': pct_score(df, 'inst_pct', False),
     })
     neglect = weighted_available(neg_scores, {'an': .5, 'sz': .3, 'in': .2}, 1)
-
     r12, r6 = df['return_12_1'], df['return_6m']
     mom = pct_score(df, 'return_12_1', True)
     mom = mom.where(~(r12 < 0), mom.clip(upper=60))
@@ -623,27 +566,21 @@ def calculate_scores(df, weights):
     mom = mom.where(~((r6 > 150) & (df['volatility'] > 80)), mom * 0.5)
     rsi_s = df['rsi'].apply(lambda x: max(0.0, 100 - abs(x - 55) * 2) if pd.notna(x) else np.nan)
     momentum = (mom * 0.7 + rsi_s * 0.3).where(rsi_s.notna(), mom)
-
     sent_scores = pd.DataFrame({
         'up': pct_score(df, 'analyst_upside', True),
         'sh': pct_score(df, 'short_pct_float', False),
     })
     sentiment = weighted_available(sent_scores, {'up': .7, 'sh': .3}, 1)
-
     low_vol = pct_score(df, 'volatility', False)
-
     factor_scores = {'value': value, 'quality': quality, 'momentum': momentum,
                      'sentiment': sentiment, 'low_vol': low_vol, 'neglect': neglect}
-
     eff_w = {}
     for k, sc in factor_scores.items():
         coverage = float(sc.notna().mean()) if len(sc) else 0.0
         eff_w[k] = weights.get(k, 0.0) if coverage >= MIN_FACTOR_COVERAGE else 0.0
     total_w = sum(eff_w.values())
     eff_w = {k: (v / total_w if total_w > 0 else 0.0) for k, v in eff_w.items()}
-
     composite = sum(eff_w[k] * factor_scores[k].fillna(MISSING_PENALTY) for k in factor_scores)
-
     df['value_score'] = value
     df['quality_score'] = quality
     df['neglect_score'] = neglect
@@ -654,8 +591,9 @@ def calculate_scores(df, weights):
     df['rating'] = composite.round(1)
     return df, eff_w
 
+
 # ============================================================
-# FILTER
+# FILTER (existing)
 # ============================================================
 def _step(df, funnel, label, cond):
     before = len(df)
@@ -668,7 +606,6 @@ def screen(raw_df, p, strategy, weights):
     df = raw_df.copy()
     if df.empty:
         return df, funnel, {}
-
     df = _step(df, funnel, "Market cap di luar rentang",
                df['market_cap'].notna() & (df['market_cap'] >= p['mcap_min']) &
                ((df['market_cap'] <= p['mcap_max']) if p['mcap_max'] > 0 else True))
@@ -676,7 +613,6 @@ def screen(raw_df, p, strategy, weights):
     df = _step(df, funnel, "Terlalu tidak likuid untuk ukuran posisi kamu", df['adv_median'] >= p['min_adv_required'])
     df = _step(df, funnel, "Terlalu banyak hari tanpa transaksi", df['zero_vol_ratio'] <= p['max_zero_vol'])
     df = _step(df, funnel, "Data fundamental terlalu bolong", df['data_completeness'] >= p['min_completeness'])
-
     pb_ok = df['pb'].isna() | (df['pb'] <= p['max_pb'])
     if p['drop_negative_book']:
         pb_ok &= df['pb'].isna() | (df['pb'] > 0)
@@ -684,7 +620,6 @@ def screen(raw_df, p, strategy, weights):
     df = _step(df, funnel, "Volatilitas terlalu tinggi", df['volatility'].isna() | (df['volatility'] <= p['max_vol']))
     df = _step(df, funnel, "Free float terlalu kecil (jika datanya ada)",
                df['float_pct'].isna() | (df['float_pct'] >= p['min_float_pct']))
-
     if p['require_profit']:
         fin = df['sector'].isin(FINANCIAL_SECTORS)
         ni, pm, roe = df['net_income'], df['profit_margin'], df['roe']
@@ -693,7 +628,6 @@ def screen(raw_df, p, strategy, weights):
             index=df.index)
         ocf_ok = df['ocf'].isna() | (df['ocf'] > 0) | fin
         df = _step(df, funnel, "Tidak laba / arus kas operasi negatif", profit_ok & ocf_ok)
-
     exempt = df['sector'].isin(LEVERAGE_EXEMPT)
     fin = df['sector'].isin(FINANCIAL_SECTORS)
     health_ok = (
@@ -702,22 +636,17 @@ def screen(raw_df, p, strategy, weights):
         (~df['distress_flag'].astype(bool) | exempt)
     )
     df = _step(df, funnel, "Kesehatan keuangan (utang / net debt-EBITDA / EBITDA negatif)", health_ok)
-
     if p['max_runup'] and p['max_runup'] > 0:
         df = _step(df, funnel, "Sudah naik terlalu tinggi 12 bulan (anti-sudah-lari)",
                    df['return_12m'].isna() | (df['return_12m'] <= p['max_runup']))
-
     limit, sma_exc, require_trend = p['knife']
     knife_ok = df['return_6m'].isna() | (df['return_6m'] > limit)
     if require_trend:
         knife_ok &= (df['above_sma200'] == True) | df['return_6m'].isna() | (df['return_6m'] > sma_exc)
     df = _step(df, funnel, "Falling knife guard", knife_ok)
-
     if df.empty:
         return df, funnel, {}
-
     df, eff_w = calculate_scores(df, weights)
-
     def _flags(r):
         f = []
         if r['extreme_move']: f.append("⚠️ret-ekstrem")
@@ -727,128 +656,470 @@ def screen(raw_df, p, strategy, weights):
         if not r['fin_currency_ok']: f.append("💱lapor-valas")
         return " ".join(f)
     df['flag'] = df.apply(_flags, axis=1)
-
     df = df.sort_values('composite_score', ascending=False).reset_index(drop=True)
     df['rank'] = range(1, len(df) + 1)
     df['days_to_exit'] = p['pos_value'] / (PARTICIPATION * df['adv_median'])
     return df, funnel, eff_w
 
-# ============================================================
-# UI
-# ============================================================
+
 def fmt_pct(x, mult=1.0, nd=1):
     return f"{x*mult:.{nd}f}%" if pd.notna(x) else "—"
 
-def main():
-    st.set_page_config(page_title="Global Stock Screener Pro", layout="wide")
-    st.title("📊 Global Stock Screener Pro v4.1")
-    st.caption(f"⚡ {MAX_WORKERS} threads | 💾 Cache {CACHE_TTL//3600} jam | 🌏 US + Indonesia | "
-               f"Batch fetch (1 call untuk semua history) + selective info")
 
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        market = st.selectbox("Market:", list(MARKETS.keys()))
-        cfg = MARKETS[market]
-        code = cfg['code']
-        is_idx = code == 'IDX'
+# ============================================================
+# [NEW v5.0] CRYPTO MODULE
+# ============================================================
+CRYPTO_UNIVERSE = {
+    'BTC-USD': 'Bitcoin', 'ETH-USD': 'Ethereum', 'BNB-USD': 'BNB',
+    'SOL-USD': 'Solana', 'XRP-USD': 'XRP', 'ADA-USD': 'Cardano',
+    'DOGE-USD': 'Dogecoin', 'AVAX-USD': 'Avalanche', 'DOT-USD': 'Polkadot',
+    'LINK-USD': 'Chainlink', 'MATIC-USD': 'Polygon', 'TRX-USD': 'TRON',
+    'LTC-USD': 'Litecoin', 'ATOM-USD': 'Cosmos', 'UNI-USD': 'Uniswap',
+    'NEAR-USD': 'NEAR', 'APT-USD': 'Aptos', 'ARB-USD': 'Arbitrum',
+    'OP-USD': 'Optimism', 'INJ-USD': 'Injective', 'SUI-USD': 'Sui',
+    'TIA-USD': 'Celestia', 'SEI-USD': 'Sei', 'RNDR-USD': 'Render',
+    'FIL-USD': 'Filecoin', 'HBAR-USD': 'Hedera', 'XLM-USD': 'Stellar',
+    'ICP-USD': 'Internet Computer', 'AAVE-USD': 'Aave', 'MKR-USD': 'Maker',
+}
 
-        strategy = st.selectbox("Strategy:", list(STRATEGY_WEIGHTS.keys()),
-                                index=len(STRATEGY_WEIGHTS) - 1 if is_idx else 0)
-        weights = STRATEGY_WEIGHTS[strategy]
-        preset = get_preset(strategy, code)
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_crypto_histories(tickers_tuple):
+    try:
+        return yf.download(list(tickers_tuple), period='1y', interval='1d',
+                          progress=False, auto_adjust=True, threads=True,
+                          group_by='ticker', timeout=30)
+    except Exception:
+        return None
 
-        use_full = st.checkbox(f"Fetch SEMUA {cfg['universe_label']}", value=cfg['default_full'], key=f"full_{code}")
-        size = st.slider("Universe size (kalau tidak full):", 30, cfg['universe_max'], cfg['default_size'], 10,
-                         disabled=use_full, key=f"size_{code}")
-        top_n = st.slider("Show Top N:", 5, 50, 20)
+def score_crypto(raw_df):
+    rows = []
+    for ticker in raw_df.columns.get_level_values(0).unique():
+        try:
+            sub = raw_df[ticker].dropna(subset=['Close'])
+            if len(sub) < 30:
+                continue
+            close = sub['Close']
+            volume = sub['Volume'].fillna(0)
+            price = float(close.iloc[-1])
+            if not np.isfinite(price) or price <= 0:
+                continue
+            ret_1d = (close.iloc[-1] / close.iloc[-2] - 1) * 100 if len(close) >= 2 else np.nan
+            ret_7d = (close.iloc[-1] / close.iloc[-8] - 1) * 100 if len(close) >= 8 else np.nan
+            ret_30d = (close.iloc[-1] / close.iloc[-31] - 1) * 100 if len(close) >= 31 else np.nan
+            ret_90d = (close.iloc[-1] / close.iloc[-91] - 1) * 100 if len(close) >= 91 else np.nan
+            vol_30d = close.pct_change().tail(30).std() * np.sqrt(365) * 100
+            sma_20 = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else np.nan
+            sma_50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else np.nan
+            rsi = calculate_rsi(close)
+            adv_usd = float((close * volume).tail(30).median())
+            rows.append({
+                'ticker': ticker, 'name': CRYPTO_UNIVERSE.get(ticker, ticker.split('-')[0]),
+                'price': price, 'ret_1d': ret_1d, 'ret_7d': ret_7d,
+                'ret_30d': ret_30d, 'ret_90d': ret_90d,
+                'vol_30d': vol_30d,
+                'above_sma20': bool(price > sma_20) if pd.notna(sma_20) else False,
+                'above_sma50': bool(price > sma_50) if pd.notna(sma_50) else False,
+                'rsi': rsi, 'adv_usd': adv_usd,
+            })
+        except Exception:
+            continue
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    def pct(col, hb=True):
+        return df[col].rank(pct=True, ascending=hb) * 100
+    df['momentum_score'] = pct('ret_30d') * 0.4 + pct('ret_90d') * 0.3 + pct('ret_7d') * 0.3
+    df['trend_score'] = df['above_sma20'].astype(float) * 50 + df['above_sma50'].astype(float) * 50
+    df['low_vol_score'] = pct('vol_30d', False)
+    df['liquidity_score'] = pct('adv_usd', True)
+    df['rsi_score'] = df['rsi'].apply(lambda x: max(0, 100 - abs(x - 55) * 2) if pd.notna(x) else 50)
+    df['composite'] = (df['momentum_score'] * 0.35 + df['trend_score'] * 0.20 +
+                       df['low_vol_score'] * 0.15 + df['liquidity_score'] * 0.15 +
+                       df['rsi_score'] * 0.15)
+    df = df.sort_values('composite', ascending=False).reset_index(drop=True)
+    df['rank'] = range(1, len(df) + 1)
+    return df
 
-        st.divider()
-        st.subheader("🎛️ Filter (instan, tanpa fetch ulang)")
-        k = f"{code}|{strategy}"
-        unit = cfg['mcap_unit']
-        c1, c2 = st.columns(2)
-        mcap_min = c1.number_input(f"Mcap min ({cfg['currency'].strip()}{unit})", min_value=0.0,
-                                   value=float(preset['mcap_min']), step=0.1, key=f"mmin|{k}")
-        mcap_max = c2.number_input("Mcap max (0=∞)", min_value=0.0,
-                                   value=float(preset['mcap_max']), step=0.5, key=f"mmax|{k}")
-        min_price = st.number_input(f"Harga minimum ({cfg['currency'].strip()})", min_value=0.0,
-                                    value=float(cfg['min_price']), step=10.0 if is_idx else 1.0, key=f"mp|{k}")
-        pos_value_u = st.number_input(cfg['pos_label'], min_value=1.0,
-                                      value=float(cfg['pos_default']), step=10.0, key=f"pos|{code}")
-        max_exit_days = st.slider("Maks. hari untuk masuk/keluar posisi", 1, 10, 3, key=f"exit|{code}",
-                                  help=f"Asumsi kamu maksimal {int(PARTICIPATION*100)}% dari volume harian.")
-        max_zero_vol = st.slider("Maks. hari tanpa transaksi (60 hari, %)", 0, 100, 25, key=f"zv|{code}")
-        min_completeness = st.slider("Min. kelengkapan data fundamental (%)", 0, 100, 50, key=f"mc|{code}")
-        max_pb = st.number_input("PBV maksimum", min_value=0.5, value=float(cfg['max_pb']),
-                                 step=0.5, key=f"pb|{code}")
-        max_vol = st.number_input("Volatilitas tahunan maks (%)", min_value=20.0,
-                                  value=float(cfg['max_vol']), step=10.0, key=f"vol|{code}")
-        min_float = st.slider("Min. free float (%)", 0, 50, 10 if is_idx else 0, key=f"fl|{code}")
-        max_runup = st.number_input("Maks. kenaikan 12 bulan (%) (0=off)", min_value=0.0,
-                                    value=float(preset['max_runup']), step=10.0, key=f"ru|{k}")
-        require_profit = st.checkbox("Wajib laba & arus kas operasi positif",
-                                     value=preset['require_profit'], key=f"rp|{k}")
 
-        st.divider()
-        st.caption("**Bobot strategi:** " + " | ".join(f"{n[:3].title()} {w*100:.0f}%"
-                                                       for n, w in weights.items() if w > 0))
-        if st.button("🗑️ Clear Cache"):
-            st.cache_data.clear()
-            st.session_state.pop('raw', None)
-            st.success("Cache cleared.")
-            st.rerun()
+# ============================================================
+# [NEW v5.0] MACRO MODULE
+# ============================================================
+MACRO_TICKERS = {
+    'VIX (Volatility)': '^VIX',
+    'DXY (USD Index)': 'DX-Y.NYB',
+    'US 10Y Yield': '^TNX',
+    'S&P 500': '^GSPC',
+    'Nasdaq': '^IXIC',
+    'Gold': 'GC=F',
+    'Crude Oil': 'CL=F',
+    'Bitcoin': 'BTC-USD',
+    'IDX Composite': '^JKSE',
+    'EM ETF (EEM)': 'EEM',
+}
 
-    if st.button("🚀 Fetch data & Run", type="primary"):
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_macro_data():
+    results = {}
+    for label, ticker in MACRO_TICKERS.items():
+        try:
+            t = yf.Ticker(ticker)
+            h = t.history(period='6mo', interval='1d', auto_adjust=True)
+            if h.empty:
+                continue
+            close = h['Close']
+            current = float(close.iloc[-1])
+            ret_1d = (close.iloc[-1] / close.iloc[-2] - 1) * 100 if len(close) >= 2 else 0.0
+            ret_1w = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(close) >= 6 else 0.0
+            ret_1m = (close.iloc[-1] / close.iloc[-22] - 1) * 100 if len(close) >= 22 else 0.0
+            sma_50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else np.nan
+            results[label] = {
+                'ticker': ticker, 'current': current,
+                'ret_1d': ret_1d, 'ret_1w': ret_1w, 'ret_1m': ret_1m,
+                'sma_50': sma_50,
+                'trend': 'bullish' if pd.notna(sma_50) and current > sma_50 else 'bearish',
+                'history': close,
+            }
+        except Exception:
+            continue
+    return results
+
+def build_macro_prompt(macro_data):
+    lines = []
+    for label, d in macro_data.items():
+        lines.append(f"- {label}: {d['current']:.2f} | 1d {d['ret_1d']:+.2f}% | "
+                     f"1w {d['ret_1w']:+.2f}% | 1m {d['ret_1m']:+.2f}% | "
+                     f"trend vs SMA50: {d['trend']}")
+    return "\n".join(lines)
+
+def run_ai_macro_analysis(api_key, macro_data, extra_context=""):
+    if not OPENAI_AVAILABLE:
+        return ("❌ **Library `openai` tidak terinstall.**\n\n"
+                "Jalankan: `pip install openai` lalu restart Streamlit.")
+    if not api_key:
+        return "🔑 Masukkan OpenAI API key di sidebar."
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        data_str = build_macro_prompt(macro_data)
+        prompt = f"""You are a senior macro strategist advising a retail investor who runs a global equity + crypto screener.
+
+CURRENT MARKET DATA (latest close):
+{data_str}
+
+{f"USER CONTEXT: {extra_context}" if extra_context else ""}
+
+Provide CONCISE analysis in this exact structure (markdown):
+
+## 🌡️ Regime Assessment
+1-2 sentences: risk-on or risk-off? Key driver.
+
+## 🚨 Top 3 Risks
+- Specific, data-driven bullets
+
+## 🎯 Top 3 Opportunities
+- Specific sectors/assets bullets
+
+## 📊 Asset Allocation Guidance
+- Equities: X% | Bonds/Cash: X% | Crypto: X% | Commodities: X% (must sum to 100%)
+
+## 🧭 Actionable Plays
+- 3-5 concrete bullets (sectors, tickers, positioning)
+
+## ⚡ Crypto-Specific View
+- 1-2 sentences on BTC/ETH regime
+
+Reference actual numbers. Avoid generic statements."""
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3, max_tokens=1200,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"❌ Error: `{e}`"
+
+
+# ============================================================
+# [NEW v5.0] PORTFOLIO MODULE
+# ============================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_portfolio_prices(tickers_tuple, period='1y'):
+    try:
+        data = yf.download(list(tickers_tuple), period=period, progress=False,
+                          auto_adjust=True, threads=True)['Close']
+        if isinstance(data, pd.Series):
+            data = data.to_frame()
+        return data.dropna(how='all')
+    except Exception:
+        return None
+
+def compute_portfolio_stats(prices, weights, rf=0.04):
+    if prices is None or prices.empty or len(prices) < 30:
+        return {}
+    returns = prices.pct_change().dropna()
+    if returns.empty:
+        return {}
+    w = np.array(weights, dtype=float)
+    w = w / w.sum()
+    mean_daily = returns.mean()
+    cov_daily = returns.cov()
+    port_ret = float((mean_daily.values * w).sum() * 252)
+    port_vol = float(np.sqrt(w @ (cov_daily.values * 252) @ w))
+    sharpe = (port_ret - rf) / port_vol if port_vol > 0 else np.nan
+    port_returns_daily = (returns * w).sum(axis=1)
+    cum = (1 + port_returns_daily).cumprod()
+    dd = cum / cum.cummax() - 1
+    max_dd = float(dd.min())
+    downside = port_returns_daily[port_returns_daily < 0].std() * np.sqrt(252)
+    sortino = (port_ret - rf) / downside if downside > 0 else np.nan
+    calmar = port_ret / abs(max_dd) if max_dd < 0 else np.nan
+    rolling_sharpe = (
+        port_returns_daily.rolling(30).mean() / port_returns_daily.rolling(30).std()
+    ) * np.sqrt(252)
+    return {
+        'annual_return': port_ret, 'annual_vol': port_vol,
+        'sharpe': sharpe, 'sortino': sortino,
+        'max_drawdown': max_dd, 'calmar': calmar,
+        'equity_curve': cum, 'drawdown': dd,
+        'daily_returns': port_returns_daily,
+        'rolling_sharpe': rolling_sharpe,
+        'weights': dict(zip(prices.columns, w)),
+    }
+
+def optimize_max_sharpe(prices, rf=0.04):
+    if not SCIPY_AVAILABLE or prices is None or prices.empty:
+        return None
+    returns = prices.pct_change().dropna()
+    if returns.empty or returns.shape[1] < 2:
+        return None
+    n = returns.shape[1]
+    mean_ret = returns.mean().values * 252
+    cov = returns.cov().values * 252
+    def neg_sharpe(w):
+        r = w @ mean_ret
+        s = np.sqrt(w @ cov @ w)
+        return -(r - rf) / s if s > 0 else 1e6
+    constraints = [{'type': 'eq', 'fun': lambda w: w.sum() - 1}]
+    bounds = [(0.0, 1.0)] * n
+    x0 = np.ones(n) / n
+    try:
+        res = minimize(neg_sharpe, x0, method='SLSQP', bounds=bounds,
+                      constraints=constraints, options={'maxiter': 500})
+        if res.success:
+            return dict(zip(prices.columns, res.x))
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================
+# [NEW v5.0] AI FUND MODULE
+# ============================================================
+def init_fund_holdings(fund, raw_df, top_n, strategy_label, capital, benchmark):
+    picks = raw_df.head(top_n).copy()
+    if picks.empty:
+        return False
+    if strategy_label == "Equal Weight":
+        weights = np.ones(len(picks)) / len(picks)
+    elif strategy_label == "Score Weighted":
+        weights = (picks['composite_score'] / picks['composite_score'].sum()).values
+    else:  # Inverse Vol
+        inv_vol = 1.0 / picks['volatility'].fillna(picks['volatility'].median())
+        weights = (inv_vol / inv_vol.sum()).values
+    fund['holdings'] = {}
+    for i, (_, row) in enumerate(picks.iterrows()):
+        alloc = capital * weights[i]
+        shares = alloc / row['price']
+        fund['holdings'][row['ticker']] = {
+            'shares': float(shares),
+            'entry_price': float(row['price']),
+            'allocation': float(alloc),
+            'entry_date': pd.Timestamp.now().normalize(),
+        }
+    fund['cash'] = 0.0
+    fund['initial_capital'] = float(capital)
+    fund['start_date'] = pd.Timestamp.now().normalize()
+    fund['benchmark'] = benchmark
+    fund['strategy_label'] = strategy_label
+    fund['top_n'] = top_n
+    return True
+
+def compute_fund_equity_curve(fund):
+    if not fund.get('holdings'):
+        return None, None
+    start = pd.Timestamp(fund['start_date']) - pd.Timedelta(days=2)
+    tickers = list(fund['holdings'].keys()) + [fund['benchmark']]
+    try:
+        hist = yf.download(tickers, start=start, progress=False,
+                          auto_adjust=True, threads=True)['Close']
+        if isinstance(hist, pd.Series):
+            hist = hist.to_frame()
+    except Exception:
+        return None, None
+    if hist.empty:
+        return None, None
+    port = pd.Series(0.0, index=hist.index)
+    for t, h in fund['holdings'].items():
+        if t in hist.columns:
+            port += hist[t].fillna(h['entry_price']) * h['shares']
+    port += fund['cash']
+    if fund['benchmark'] in hist.columns:
+        bench_series = hist[fund['benchmark']].dropna()
+        if not bench_series.empty:
+            bench = bench_series / bench_series.iloc[0] * fund['initial_capital']
+        else:
+            bench = None
+    else:
+        bench = None
+    return port, bench
+
+def run_ai_fund_review(api_key, fund, macro_summary=""):
+    if not OPENAI_AVAILABLE:
+        return "❌ Install `openai` dulu: `pip install openai`"
+    if not api_key:
+        return "🔑 Masukkan OpenAI API key di sidebar."
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        holdings_str = "\n".join(
+            f"- {t}: {h['shares']:.2f} shares @ ${h['entry_price']:.2f} "
+            f"(alloc ${h['allocation']:.0f})"
+            for t, h in fund['holdings'].items()
+        )
+        prompt = f"""You are an AI portfolio manager reviewing a small paper-trading fund.
+
+FUND STATE:
+- Initial capital: ${fund['initial_capital']:.0f}
+- Current value: ${fund.get('current_value', fund['initial_capital']):.0f}
+- PnL: {((fund.get('current_value', fund['initial_capital'])/fund['initial_capital'])-1)*100:+.2f}%
+- Strategy: {fund.get('strategy_label', 'Equal Weight')}
+- Benchmark: {fund.get('benchmark', 'SPY')}
+
+HOLDINGS:
+{holdings_str}
+
+{f"MACRO CONTEXT:{chr(10)}{macro_summary}" if macro_summary else ""}
+
+Provide a concise review (markdown, max 250 words):
+
+## 🎯 Verdict
+One of: **HOLD** / **REBALANCE** / **EXIT** (bold, first line)
+
+## ✅ What's Working
+- 2-3 bullets
+
+## ⚠️ What to Watch
+- 2-3 bullets
+
+## 🔄 Suggested Actions
+- 2-3 concrete bullets (add/trim/exit which ticker, why)
+
+Be specific and data-driven."""
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3, max_tokens=800,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"❌ Error: `{e}`"
+
+
+# ============================================================
+# [NEW v5.0] UI HELPERS
+# ============================================================
+def inject_custom_css():
+    st.markdown("""
+    <style>
+    .main .block-container { padding-top: 1.5rem; max-width: 1400px; }
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 2px solid #eee; }
+    .stTabs [data-baseweb="tab"] {
+        height: 46px; padding: 0 18px; background-color: #f7f9fc;
+        border-radius: 8px 8px 0 0; font-weight: 500;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #1f77b4 0%, #2a9d8f 100%);
+        color: white !important;
+    }
+    div[data-testid="stMetricValue"] { font-size: 1.4rem; font-weight: 700; }
+    div[data-testid="stMetricLabel"] { font-size: 0.85rem; color: #666; }
+    .stButton > button { border-radius: 8px; font-weight: 500; transition: all 0.2s; }
+    .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+    .stDataFrame { border-radius: 8px; }
+    div[data-testid="stExpander"] { border-radius: 8px; border: 1px solid #eee; }
+    .stAlert { border-radius: 8px; }
+    h1 { background: linear-gradient(90deg, #1f77b4, #2a9d8f);
+         -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+         font-weight: 800; }
+    .stCaption { color: #666; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def render_stock_screener(settings):
+    cfg = settings['cfg']
+    code = settings['code']
+    is_idx = settings['is_idx']
+    strategy = settings['strategy']
+    weights = settings['weights']
+    preset = settings['preset']
+    use_full = settings['use_full']
+    size = settings['size']
+    top_n = settings['top_n']
+
+    if st.button("🚀 Fetch data & Run", type="primary", key="run_screener"):
         all_tickers = get_sp500_tickers() if code == 'US' else get_idx_tickers()
         tickers = sample_universe(all_tickers, size, use_full)
-        st.info(f"Fetch **{len(tickers)}** dari {len(all_tickers)} ticker {cfg['universe_label']} "
-                f"(batch mode, hasil di-cache {CACHE_TTL//3600} jam).")
+        st.info(f"Fetch **{len(tickers)}** dari {len(all_tickers)} ticker {cfg['universe_label']} (batch mode, cache {CACHE_TTL//3600} jam).")
         bar = st.progress(0, text="Mulai...")
         def cb(c, t, tk):
             bar.progress(min(c / max(t, 1), 1.0), text=f"[{c}/{t}] {tk}")
         raw_df, counts, failed = fetch_universe(tickers, cfg['suffix'], cfg['fetch_min_adv'], cb)
         bar.empty()
-        st.session_state['raw'] = {'code': code, 'df': raw_df, 'counts': counts, 'failed': failed,
-                                   'n_requested': len(tickers), 'n_universe': len(all_tickers)}
+        st.session_state['raw'] = {
+            'code': code, 'df': raw_df, 'counts': counts, 'failed': failed,
+            'n_requested': len(tickers), 'n_universe': len(all_tickers)
+        }
 
     raw = st.session_state.get('raw')
     if not raw or raw['code'] != code:
-        st.info("Klik **Fetch data & Run** dulu. Setelah data masuk, ubah slider/filter di sidebar → hasil langsung ter-update.")
-        return
-    raw_df = raw['df']
-    if raw_df.empty:
-        st.error(f"Tidak ada data. Status fetch: {raw['counts']}. Coba lagi beberapa menit (kemungkinan rate limit Yahoo).")
+        st.info("Klik **🚀 Fetch data & Run** dulu. Setelah data masuk, ubah slider di sidebar → hasil auto-update.")
         return
 
-    pos_value = pos_value_u * cfg['pos_mult']
+    raw_df = raw['df']
+    if raw_df.empty:
+        st.error(f"Tidak ada data. Status: {raw['counts']}. Coba lagi (kemungkinan rate limit Yahoo).")
+        return
+
+    pos_value = settings['pos_value_u'] * cfg['pos_mult']
     params = {
-        'mcap_min': mcap_min * cfg['mcap_mult'], 'mcap_max': mcap_max * cfg['mcap_mult'],
-        'min_price': min_price, 'pos_value': pos_value,
-        'min_adv_required': pos_value / (PARTICIPATION * max_exit_days),
-        'max_zero_vol': max_zero_vol / 100.0, 'min_completeness': float(min_completeness),
-        'max_pb': max_pb, 'drop_negative_book': is_idx, 'max_vol': max_vol,
-        'min_float_pct': float(min_float), 'max_runup': max_runup,
-        'require_profit': require_profit, 'knife': preset['knife'],
+        'mcap_min': settings['mcap_min'] * cfg['mcap_mult'],
+        'mcap_max': settings['mcap_max'] * cfg['mcap_mult'],
+        'min_price': settings['min_price'], 'pos_value': pos_value,
+        'min_adv_required': pos_value / (PARTICIPATION * max(settings['max_exit_days'], 1)),
+        'max_zero_vol': settings['max_zero_vol'] / 100.0,
+        'min_completeness': float(settings['min_completeness']),
+        'max_pb': settings['max_pb'], 'drop_negative_book': is_idx,
+        'max_vol': settings['max_vol'], 'min_float_pct': float(settings['min_float']),
+        'max_runup': settings['max_runup'],
+        'require_profit': settings['require_profit'], 'knife': preset['knife'],
     }
     df, funnel, eff_w = screen(raw_df, params, strategy, weights)
 
-    st.success(f"✅ **{len(df)} saham** lolos semua filter (dari {len(raw_df)} yang datanya berhasil di-fetch).")
+    st.success(f"✅ **{len(df)} saham** lolos semua filter (dari {len(raw_df)} berhasil di-fetch).")
     with st.expander("ℹ️ Funnel: kenapa jumlahnya segini"):
-        st.write(f"- Diminta: {raw['n_requested']} ticker | Data berhasil: {len(raw_df)}")
+        st.write(f"- Diminta: {raw['n_requested']} | Data OK: {len(raw_df)}")
         st.write(f"- Status fetch: {raw['counts']}")
         for label, n in funnel:
             st.write(f"- {label}: **-{n}**")
         st.write(f"- **Lolos: {len(df)}**")
         if eff_w:
-            st.write("- Bobot efektif: " +
-                     ", ".join(f"{k} {v*100:.0f}%" for k, v in eff_w.items() if v > 0))
+            st.write("- Bobot efektif: " + ", ".join(f"{k} {v*100:.0f}%" for k, v in eff_w.items() if v > 0))
     if raw['failed']:
-        with st.expander("⚠️ Ticker yang gagal / dibuang saat fetch"):
+        with st.expander("⚠️ Ticker gagal / dibuang"):
             for status, lst in raw['failed'].items():
                 st.write(f"**{status}** ({len(lst)}): " + ", ".join(lst[:80]) + (" ..." if len(lst) > 80 else ""))
 
     if df.empty:
-        st.warning("Tidak ada saham yang lolos. Longgarkan filter di sidebar.")
+        st.warning("Tidak ada yang lolos. Longgarkan filter di sidebar.")
         return
 
     st.subheader(f"🏆 Top {top_n} — {strategy}")
@@ -874,16 +1145,189 @@ def main():
         'Flag': t['flag'],
     })
     st.dataframe(out, use_container_width=True, hide_index=True)
-    st.caption("Skor 0-100 = persentil dalam sektor. Flag ⚠️/💧/🔸/🚀 = hal yang perlu dicek manual. "
-               "Ini daftar KANDIDAT, bukan sinyal beli.")
+    st.caption("Skor 0-100 = persentil dalam sektor. Flag ⚠️/💧/🔸/🚀 = cek manual. Ini KANDIDAT, bukan sinyal beli.")
 
-    st.subheader("🏭 Sector Distribution")
-    st.bar_chart(t['sector'].value_counts())
-    st.subheader("📊 Factor Breakdown")
-    st.bar_chart(t.set_index('ticker')[['value_score', 'quality_score', 'neglect_score',
-                                        'momentum_score_final', 'low_vol_score_final']])
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("🏭 Sector Distribution")
+        st.bar_chart(t['sector'].value_counts())
+    with c2:
+        st.subheader("📊 Factor Breakdown")
+        st.bar_chart(t.set_index('ticker')[['value_score', 'quality_score', 'neglect_score',
+                                            'momentum_score_final', 'low_vol_score_final']])
     st.download_button("📥 Download CSV (semua hasil)", df.to_csv(index=False).encode('utf-8'),
                        "screener_results.csv", "text/csv")
 
-if __name__ == "__main__":
-    main()
+
+def render_crypto_screener():
+    st.subheader("🪙 Crypto Screener")
+    st.caption(f"Live data (cache 60s) · {len(CRYPTO_UNIVERSE)} top coins · "
+               "Scoring: momentum (35%) + trend (20%) + low-vol (15%) + liquidity (15%) + RSI (15%)")
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        if st.button("🔄 Refresh (live)", type="primary", key="crypto_refresh"):
+            st.cache_data.clear()
+            st.rerun()
+    with c2:
+        top_n = st.number_input("Top N", 5, len(CRYPTO_UNIVERSE), 15, key="crypto_topn")
+    with c3:
+        st.caption(f"⏱️ Last fetch: {pd.Timestamp.now().strftime('%H:%M:%S')} (WIB)")
+
+    with st.spinner("Fetch crypto histories..."):
+        raw = fetch_crypto_histories(tuple(CRYPTO_UNIVERSE.keys()))
+    if raw is None or raw.empty:
+        st.error("Gagal fetch crypto data. Coba refresh.")
+        return
+
+    df = score_crypto(raw)
+    if df.empty:
+        st.warning("Tidak ada crypto yang berhasil di-score.")
+        return
+
+    top = df.head(int(top_n))
+    st.subheader(f"🏆 Top {top_n} Crypto")
+    display = pd.DataFrame({
+        'Rank': top['rank'], 'Ticker': top['ticker'], 'Name': top['name'],
+        'Price': top['price'].apply(lambda x: f"${x:,.4f}" if x < 1 else f"${x:,.2f}"),
+        '1D %': top['ret_1d'].apply(lambda x: fmt_pct(x)),
+        '7D %': top['ret_7d'].apply(lambda x: fmt_pct(x)),
+        '30D %': top['ret_30d'].apply(lambda x: fmt_pct(x)),
+        '90D %': top['ret_90d'].apply(lambda x: fmt_pct(x)),
+        'Vol 30D': top['vol_30d'].apply(lambda x: fmt_pct(x, 1)),
+        'RSI': top['rsi'].round(1),
+        'SMA20': top['above_sma20'].map({True: '✅', False: '❌'}),
+        'SMA50': top['above_sma50'].map({True: '✅', False: '❌'}),
+        'Score': top['composite'].round(1),
+    })
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # Price chart for top 5
+    st.subheader("📈 Top 5 — Price (90D, normalized)")
+    top5 = df.head(5)['ticker'].tolist()
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        for tk in top5:
+            try:
+                series = raw[tk]['Close'].dropna().tail(90)
+                if not series.empty:
+                    norm = series / series.iloc[0] * 100
+                    fig.add_trace(go.Scatter(x=norm.index, y=norm.values, name=tk, mode='lines'))
+            except Exception:
+                continue
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
+                          legend=dict(orientation='h', y=1.1),
+                          yaxis_title="Indexed (100 = 90d ago)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        norm_data = pd.DataFrame({
+            tk: (raw[tk]['Close'].dropna().tail(90) / raw[tk]['Close'].dropna().tail(90).iloc[0] * 100)
+            for tk in top5
+        })
+        st.line_chart(norm_data)
+
+    # Volume
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("💰 30D Return")
+        st.bar_chart(df.set_index('ticker')['ret_30d'].head(15))
+    with c2:
+        st.subheader("📊 Volatility (30D annualized)")
+        st.bar_chart(df.set_index('ticker')['vol_30d'].head(15))
+
+
+def render_macro_ai(openai_key):
+    st.subheader("🌍 Macro Overview + AI Analysis")
+    st.caption("Data: yfinance (10 indikator) · AI: OpenAI gpt-4o-mini (opsional)")
+
+    with st.spinner("Fetch macro data..."):
+        macro = fetch_macro_data()
+    if not macro:
+        st.error("Gagal fetch macro data.")
+        return
+
+    # Metric cards
+    cols = st.columns(5)
+    items = list(macro.items())
+    for i, (label, d) in enumerate(items):
+        with cols[i % 5]:
+            delta_color = "normal" if d['ret_1d'] >= 0 else "inverse"
+            st.metric(label=label, value=f"{d['current']:.2f}",
+                      delta=f"{d['ret_1d']:+.2f}% (1d)")
+
+    st.divider()
+
+    # Snapshot table
+    with st.expander("📋 Full Snapshot", expanded=False):
+        snap = pd.DataFrame([{
+            'Indicator': label, 'Ticker': d['ticker'],
+            'Current': f"{d['current']:.2f}",
+            '1D %': f"{d['ret_1d']:+.2f}",
+            '1W %': f"{d['ret_1w']:+.2f}",
+            '1M %': f"{d['ret_1m']:+.2f}",
+            'Trend vs SMA50': d['trend'],
+        } for label, d in items])
+        st.dataframe(snap, use_container_width=True, hide_index=True)
+
+    # Charts
+    st.subheader("📈 Price Charts (6M, normalized)")
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        for label, d in items:
+            series = d['history'].dropna()
+            if not series.empty:
+                norm = series / series.iloc[0] * 100
+                fig.add_trace(go.Scatter(x=norm.index, y=norm.values, name=label, mode='lines'))
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
+                          legend=dict(orientation='h', y=1.1),
+                          yaxis_title="Indexed (100 = 6mo ago)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.line_chart(pd.DataFrame({label: d['history'] for label, d in items}))
+
+    # AI Analysis
+    st.divider()
+    st.subheader("🤖 AI Macro Analysis")
+    extra_ctx = st.text_area("Context / pertanyaan tambahan (opsional):",
+                             placeholder="Misal: 'Saya 70% US equity, 20% crypto, 10% cash. Perlu rebalance?'",
+                             key="macro_context")
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        run_btn = st.button("🧠 Run AI Analysis", type="primary", key="run_macro_ai")
+    with col2:
+        if not OPENAI_AVAILABLE:
+            st.warning("⚠️ Library `openai` belum terinstall. `pip install openai`")
+        elif not openai_key:
+            st.info("🔑 Masukkan OpenAI API key di sidebar untuk mengaktifkan AI.")
+
+    if run_btn:
+        if not openai_key:
+            st.error("Butuh OpenAI API key.")
+        else:
+            with st.spinner("AI menganalisis macro..."):
+                result = run_ai_macro_analysis(openai_key, macro, extra_ctx)
+            st.markdown(result)
+            st.session_state['macro_ai_result'] = result
+    elif 'macro_ai_result' in st.session_state:
+        st.markdown(st.session_state['macro_ai_result'])
+
+
+def render_portfolio(openai_key, code):
+    st.subheader("💼 Portfolio Builder + Sharpe Ratio")
+    st.caption("Analisis risk-adjusted return dari portofolio custom.")
+
+    # Ticker source
+    raw = st.session_state.get('raw')
+    screener_tickers = []
+    if raw and not raw['df'].empty:
+        screener_tickers = raw['df']['ticker'].tolist()
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        default_tickers = ", ".join(screener_tickers[:5]) if screener_tickers else "AAPL, MSFT, GOOGL, AMZN, NVDA"
+        tickers_input = st.text_input("Tickers (comma-separated)",
+                                       value=default_tickers, key="port_tickers")
+    with c2:
+        if screener_tickers and st.button("📥 Import Top-10 dari screener", key="port_import"):
+            st.session_state['port_tickers'] = ", ".
