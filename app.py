@@ -1604,24 +1604,62 @@ def render_sidebar():
         k = f"{code}|{strategy}"
         unit = cfg['mcap_unit']
         c1, c2 = st.columns(2)
-        mcap_min = c1.number_input(f"Mcap min ({unit})", 0.0,
-                                    float(preset['mcap_min']), 0.1, key=f"mmin|{k}")
-        mcap_max = c2.number_input("Mcap max (0=∞)", 0.0,
-                                    float(preset['mcap_max']), 0.5, key=f"mmax|{k}")
-        min_price = st.number_input("Harga min", 0.0, float(cfg['min_price']),
-                                    10.0 if is_idx else 1.0, key=f"mp|{k}")
-        pos_value_u = st.number_input(cfg['pos_label'], 1.0,
-                                       float(cfg['pos_default']), 10.0, key=f"pos|{code}")
+
+        # ✅ Explicit min_value / value — gak ada positional max_value
+        mcap_min = c1.number_input(
+            f"Mcap min ({unit})",
+            min_value=0.0,
+            value=float(preset['mcap_min']),
+            step=0.1,
+            key=f"mmin|{k}",
+        )
+        mcap_max = c2.number_input(
+            "Mcap max (0=∞)",
+            min_value=0.0,
+            value=float(preset['mcap_max']),
+            step=0.5,
+            key=f"mmax|{k}",
+        )
+        min_price = st.number_input(
+            "Harga min",
+            min_value=0.0,
+            value=float(cfg['min_price']),
+            step=10.0 if is_idx else 1.0,
+            key=f"mp|{k}",
+        )
+        pos_value_u = st.number_input(
+            cfg['pos_label'],
+            min_value=1.0,
+            value=float(cfg['pos_default']),
+            step=10.0,
+            key=f"pos|{code}",
+        )
         max_exit_days = st.slider("Maks. hari exit", 1, 10, 3, key=f"exit|{code}")
         max_zero_vol = st.slider("Maks. hari tanpa transaksi (%)", 0, 100, 25, key=f"zv|{code}")
         min_completeness = st.slider("Min. kelengkapan data (%)", 0, 100, 50, key=f"mc|{code}")
-        max_pb = st.number_input("PBV maksimum", 0.5, float(cfg['max_pb']), 0.5, key=f"pb|{code}")
-        max_vol = st.number_input("Volatilitas max (%)", 20.0,
-                                    float(cfg['max_vol']), 10.0, key=f"vol|{code}")
+        max_pb = st.number_input(
+            "PBV maksimum",
+            min_value=0.5,
+            value=float(cfg['max_pb']),
+            step=0.5,
+            key=f"pb|{code}",
+        )
+        max_vol = st.number_input(
+            "Volatilitas max (%)",
+            min_value=20.0,
+            value=float(cfg['max_vol']),
+            step=10.0,
+            key=f"vol|{code}",
+        )
         min_float = st.slider("Min. free float (%)", 0, 50,
                                10 if is_idx else 0, key=f"fl|{code}")
-        max_runup = st.number_input("Maks. kenaikan 12M (%)", 0.0,
-                                     float(preset['max_runup']), 10.0, key=f"ru|{k}")
+        max_runup = st.number_input(
+            "Maks. kenaikan 12M (%)",
+            min_value=0.0,
+            value=float(preset['max_runup']),
+            step=10.0,
+            key=f"ru|{k}",
+        )
         require_profit = st.checkbox("Wajib laba & OCF positif",
                                       value=preset['require_profit'], key=f"rp|{k}")
 
