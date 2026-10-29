@@ -1317,17 +1317,361 @@ def render_portfolio(openai_key, code):
     st.subheader("💼 Portfolio Builder + Sharpe Ratio")
     st.caption("Analisis risk-adjusted return dari portofolio custom.")
 
-    # Ticker source
     raw = st.session_state.get('raw')
     screener_tickers = []
     if raw and not raw['df'].empty:
         screener_tickers = raw['df']['ticker'].tolist()
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        default_tickers = ", ".join(screener_tickers[:5]) if screener_tickers else "AAPL, MSFT, GOOGL, AMZN, NVDA"
-        tickers_input = st.text_input("Tickers (comma-separated)",
-                                       value=default_tickers, key="port_tickers")
+    # Init default SEBELUM widget dibuat
+    if "port_tickers" not in st.session_state:
+        st.session_state["port_tickers"] = (
+            ", ".join(screener_tickers[:5]) if screener_tickers
+            else "AAPL, MSFT, GOOGL, AMZN, NVDA"
+        )
+
+    # ⚠️ IMPORTANT: tombol HARUS dirender SEBELUM text_input
+    c1, c2 = st.columns([3, 1])
     with c2:
-        if screener_tickers and st.button("📥 Import Top-10 dari screener", key="port_import"):
-            st.session_state['port_tickers'] = ", ".
+        if screener_tickers and st.button("📥 Import Top-10", key="port_import"):
+            # aman: text_input belum dibuat di run ini
+            st.session_state["port_tickers"] = ", ".join(screener_tickers[:10])
+    with c1:
+        tickers_input = st.text_input("Tickers (comma-separated)", key="port_tickers")
+
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    if len(tickers) < 2:
+        st.warning("Minimal 2 ticker.")
+        return
+
+    with st.spinner(f"Fetch prices untuk {len(tickers)} ticker..."):
+        prices = fetch_portfolio_prices(tuple(tickers))
+    if prices is None or prices.empty:
+        st.error("Gagal fetch harga.")
+        return
+
+    available = [t for t in tickers if t in prices.columns]
+    prices = prices[available]
+    if len(available) < 2:
+        st.error(f"Hanya {len(available)} ticker valid.")
+        return
+
+    st.subheader("⚖️ Bobot")
+    weight_mode = st.radio("Metode bobot:",
+                          ["Equal Weight", "Custom", "Max Sharpe (optimizer)"],
+                          horizontal=True, key="weight_mode")
+
+    n = len(available)
+    weights = None
+    if weight_mode == "Equal Weight":
+        weights = np.ones(n) / n
+    elif weight_mode == "Custom":
+        cols = st.columns(min(n, 5))
+        w_list = []
+        for i, t in enumerate(available):
+            with cols[i % min(n, 5)]:
+                w = st.number_input(t, 0.0, 100.0, float(100.0/n), step=1.0, key=f"w_{t}")
+                w_list.append(w)
+        w_arr = np.array(w_list)
+        weights = w_arr / w_arr.sum() if w_arr.sum() > 0 else np.ones(n) / n
+    else:  # Max Sharpe
+        if not SCIPY_AVAILABLE:
+            st.warning("scipy belum terinstall. Pakai equal weight.")
+            weights = np.ones(n) / n
+        else:
+            opt = optimize_max_sharpe(prices)
+            if opt:
+                weights = np.array([opt.get(t, 0) for t in available])
+                st.success("✅ Max-Sharpe optimizer berhasil.")
+            else:
+                weights = np.ones(n) / n
+                st.warning("Optimizer gagal, pakai equal weight.")
+
+    if weights is not None:
+        st.write("**Bobot final:** " + ", ".join(
+            f"{t} {w*100:.1f}%" for t, w in zip(available, weights)))
+
+    rf = st.slider("Risk-free rate (annual %)", 0.0, 15.0, 4.0, 0.1, key="rf") / 100
+    stats = compute_portfolio_stats(prices, weights, rf)
+    if not stats:
+        st.error("Gagal hitung statistik.")
+        return
+
+    st.subheader("📊 Performance Metrics")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Annual Return", f"{stats['annual_return']*100:.2f}%")
+    m2.metric("Annual Vol", f"{stats['annual_vol']*100:.2f}%")
+    m3.metric("Sharpe", f"{stats['sharpe']:.2f}")
+    m4.metric("Sortino", f"{stats['sortino']:.2f}" if pd.notna(stats['sortino']) else "—")
+    m5.metric("Max Drawdown", f"{stats['max_drawdown']*100:.2f}%")
+
+    m6, m7 = st.columns(2)
+    m6.metric("Calmar", f"{stats['calmar']:.2f}" if pd.notna(stats['calmar']) else "—")
+    m7.metric("Risk-Free", f"{rf*100:.1f}%")
+
+    st.divider()
+
+    st.subheader("📈 Equity Curve ($10,000 initial)")
+    equity = stats['equity_curve'] * 10000
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=equity.index, y=equity.values,
+                                 name='Portfolio', line=dict(color='#1f77b4', width=2)))
+        fig.update_layout(height=350, margin=dict(l=10, r=10, t=30, b=10),
+                          yaxis_title="Value ($)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.line_chart(equity)
+
+    st.subheader("📉 Drawdown")
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=stats['drawdown'].index,
+                                 y=stats['drawdown'].values * 100,
+                                 name='Drawdown', fill='tozeroy',
+                                 line=dict(color='crimson')))
+        fig.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=10),
+                          yaxis_title="Drawdown (%)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.area_chart(stats['drawdown'] * 100)
+
+    st.subheader("📊 Rolling 30D Sharpe")
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=stats['rolling_sharpe'].index,
+                                 y=stats['rolling_sharpe'].values,
+                                 name='Rolling Sharpe', line=dict(color='#2a9d8f')))
+        fig.add_hline(y=1, line_dash="dash", line_color="green")
+        fig.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.line_chart(stats['rolling_sharpe'])
+
+    st.subheader("🔗 Correlation Matrix")
+    corr = prices.pct_change().dropna().corr()
+    if PLOTLY_AVAILABLE:
+        fig = px.imshow(corr, text_auto=".2f", aspect="auto",
+                        color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+        fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.dataframe(corr.round(2))
+
+
+def render_ai_fund(openai_key, code):
+    st.subheader("🤖 AI Fund — Paper Trading")
+    st.caption("Simulasi portofolio yang dikelola bot dari Top-N screener.")
+
+    raw = st.session_state.get('raw')
+    if not raw or raw['df'].empty:
+        st.info("⚠️ Jalankan **Stock Screener** (tab 1) dulu untuk punya kandidat.")
+        return
+
+    if 'fund' not in st.session_state:
+        st.session_state['fund'] = {}
+    fund = st.session_state['fund']
+
+    if not fund.get('holdings'):
+        st.info("🚀 Fund belum diinisialisasi. Setup dulu:")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            capital = st.number_input("Capital ($)", 1000.0, 100_000_000.0,
+                                       100_000.0, 1000.0, key="fund_cap")
+        with c2:
+            top_n = st.number_input("Top N picks", 3, 50, 10, key="fund_topn")
+        with c3:
+            strategy_label = st.selectbox("Weighting:",
+                                          ["Equal Weight", "Score Weighted", "Inverse Vol"],
+                                          key="fund_wmode")
+        with c4:
+            benchmark = st.selectbox("Benchmark:",
+                                     ["^GSPC", "^JKSE", "SPY", "QQQ"],
+                                     key="fund_bench")
+        if st.button("🚀 Launch AI Fund", type="primary", key="fund_init"):
+            ok = init_fund_holdings(fund, raw['df'], int(top_n), strategy_label,
+                                    float(capital), benchmark)
+            if ok:
+                st.success(f"✅ Fund launched: {top_n} saham, ${capital:,.0f}")
+                st.rerun()
+            else:
+                st.error("Gagal inisialisasi fund.")
+        return
+
+    st.subheader(f"📊 AI Fund · {fund['strategy_label']} · Top {fund['top_n']}")
+    with st.spinner("Menghitung equity curve..."):
+        port, bench = compute_fund_equity_curve(fund)
+
+    if port is not None and not port.empty:
+        fund['current_value'] = float(port.iloc[-1])
+        initial = fund['initial_capital']
+        pnl = (fund['current_value'] / initial - 1) * 100
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Current Value", f"${fund['current_value']:,.2f}", f"{pnl:+.2f}%")
+        m2.metric("Initial Capital", f"${initial:,.2f}")
+        m3.metric("Benchmark", fund['benchmark'])
+
+        if PLOTLY_AVAILABLE:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=port.index, y=port.values, name='AI Fund',
+                                     line=dict(color='#1f77b4', width=2)))
+            if bench is not None and not bench.empty:
+                fig.add_trace(go.Scatter(x=bench.index, y=bench.values,
+                                         name='Benchmark',
+                                         line=dict(color='orange', width=2, dash='dash')))
+            fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
+                              yaxis_title="Value ($)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            compare = pd.DataFrame({'AI Fund': port})
+            if bench is not None:
+                compare['Benchmark'] = bench
+            st.line_chart(compare)
+
+    st.subheader("💼 Holdings")
+    holdings_rows = []
+    for t, h in fund['holdings'].items():
+        try:
+            current_price = float(yf.Ticker(t).history(period='1d')['Close'].iloc[-1])
+        except Exception:
+            current_price = h['entry_price']
+        current_val = current_price * h['shares']
+        pnl_pct = (current_price / h['entry_price'] - 1) * 100
+        holdings_rows.append({
+            'Ticker': t, 'Shares': f"{h['shares']:.2f}",
+            'Entry': f"${h['entry_price']:.2f}",
+            'Current': f"${current_price:.2f}",
+            'Value': f"${current_val:,.0f}",
+            'PnL %': f"{pnl_pct:+.2f}%",
+        })
+    st.dataframe(pd.DataFrame(holdings_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("🤖 AI Fund Review")
+    macro_summary = st.session_state.get('macro_ai_result', '')[:1500]
+
+    if st.button("🧠 Run AI Review", type="primary", key="fund_review"):
+        if not openai_key:
+            st.error("Butuh OpenAI API key.")
+        else:
+            with st.spinner("AI me-review fund..."):
+                review = run_ai_fund_review(openai_key, fund, macro_summary)
+            st.markdown(review)
+            st.session_state['fund_ai_review'] = review
+    elif 'fund_ai_review' in st.session_state:
+        st.markdown(st.session_state['fund_ai_review'])
+
+    if st.button("🗑️ Reset Fund", key="fund_reset"):
+        st.session_state['fund'] = {}
+        st.session_state.pop('fund_ai_review', None)
+        st.rerun()
+
+
+def render_sidebar():
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        st.subheader("🔑 AI")
+        openai_key = st.text_input("OpenAI API Key", type="password",
+                                    key="openai_key",
+                                    help="Untuk Macro AI & AI Fund review")
+        if openai_key:
+            st.success("✅ Key set")
+        elif not OPENAI_AVAILABLE:
+            st.warning("Install `openai` untuk aktifkan AI")
+
+        st.divider()
+        st.subheader("📈 Market")
+        market = st.selectbox("Market:", list(MARKETS.keys()), key="market_select")
+        cfg = MARKETS[market]
+        code = cfg['code']
+        is_idx = code == 'IDX'
+
+        strategy = st.selectbox("Strategy:", list(STRATEGY_WEIGHTS.keys()),
+                                index=len(STRATEGY_WEIGHTS) - 1 if is_idx else 0,
+                                key="strategy_select")
+        weights = STRATEGY_WEIGHTS[strategy]
+        preset = get_preset(strategy, code)
+
+        use_full = st.checkbox(f"Fetch SEMUA {cfg['universe_label']}",
+                                value=cfg['default_full'], key=f"full_{code}")
+        size = st.slider("Universe size:", 30, cfg['universe_max'],
+                         cfg['default_size'], 10, disabled=use_full, key=f"size_{code}")
+        top_n = st.slider("Show Top N:", 5, 50, 20, key="topn_slider")
+
+        st.divider()
+        st.subheader("🎛️ Filter (instan)")
+        k = f"{code}|{strategy}"
+        unit = cfg['mcap_unit']
+        c1, c2 = st.columns(2)
+        mcap_min = c1.number_input(f"Mcap min ({unit})", 0.0,
+                                    float(preset['mcap_min']), 0.1, key=f"mmin|{k}")
+        mcap_max = c2.number_input("Mcap max (0=∞)", 0.0,
+                                    float(preset['mcap_max']), 0.5, key=f"mmax|{k}")
+        min_price = st.number_input("Harga min", 0.0, float(cfg['min_price']),
+                                    10.0 if is_idx else 1.0, key=f"mp|{k}")
+        pos_value_u = st.number_input(cfg['pos_label'], 1.0,
+                                       float(cfg['pos_default']), 10.0, key=f"pos|{code}")
+        max_exit_days = st.slider("Maks. hari exit", 1, 10, 3, key=f"exit|{code}")
+        max_zero_vol = st.slider("Maks. hari tanpa transaksi (%)", 0, 100, 25, key=f"zv|{code}")
+        min_completeness = st.slider("Min. kelengkapan data (%)", 0, 100, 50, key=f"mc|{code}")
+        max_pb = st.number_input("PBV maksimum", 0.5, float(cfg['max_pb']), 0.5, key=f"pb|{code}")
+        max_vol = st.number_input("Volatilitas max (%)", 20.0,
+                                    float(cfg['max_vol']), 10.0, key=f"vol|{code}")
+        min_float = st.slider("Min. free float (%)", 0, 50,
+                               10 if is_idx else 0, key=f"fl|{code}")
+        max_runup = st.number_input("Maks. kenaikan 12M (%)", 0.0,
+                                     float(preset['max_runup']), 10.0, key=f"ru|{k}")
+        require_profit = st.checkbox("Wajib laba & OCF positif",
+                                      value=preset['require_profit'], key=f"rp|{k}")
+
+        st.divider()
+        st.caption("**Bobot strategi:** " + " | ".join(
+            f"{n.split()[0]} {w*100:.0f}%" for n, w in weights.items() if w > 0))
+
+        if st.button("🗑️ Clear Cache", key="clear_cache"):
+            st.cache_data.clear()
+            st.session_state.pop('raw', None)
+            st.success("Cache cleared.")
+            st.rerun()
+
+    return {
+        'openai_key': openai_key,
+        'market': market, 'cfg': cfg, 'code': code, 'is_idx': is_idx,
+        'strategy': strategy, 'weights': weights, 'preset': preset,
+        'use_full': use_full, 'size': size, 'top_n': top_n,
+        'mcap_min': mcap_min, 'mcap_max': mcap_max, 'min_price': min_price,
+        'pos_value_u': pos_value_u, 'max_exit_days': max_exit_days,
+        'max_zero_vol': max_zero_vol, 'min_completeness': min_completeness,
+        'max_pb': max_pb, 'max_vol': max_vol, 'min_float': min_float,
+        'max_runup': max_runup, 'require_profit': require_profit,
+    }
+
+
+def main():
+    st.set_page_config(page_title="Global Stock Screener Pro v5.0",
+                       page_icon="📊", layout="wide")
+    inject_custom_css()
+
+    st.title("📊 Global Stock Screener Pro v5.0")
+    st.caption(f"⚡ {MAX_WORKERS} threads | 💾 Cache {CACHE_TTL//3600}j | "
+               f"🌏 US + IDX | 🪙 Crypto | 🤖 AI Macro")
+
+    settings = render_sidebar()
+
+    tabs = st.tabs(["📈 Stock Screener", "🪙 Crypto", "🌍 Macro AI",
+                    "💼 Portfolio", "🤖 AI Fund"])
+    with tabs[0]:
+        render_stock_screener(settings)
+    with tabs[1]:
+        render_crypto_screener()
+    with tabs[2]:
+        render_macro_ai(settings['openai_key'])
+    with tabs[3]:
+        render_portfolio(settings['openai_key'], settings['code'])
+    with tabs[4]:
+        render_ai_fund(settings['openai_key'], settings['code'])
+
+
+if __name__ == "__main__":
+    main()
